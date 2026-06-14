@@ -1,0 +1,27 @@
+软件名称：黑灰产态势感知与数据分析看板系统
+版本号：V1.0
+总代码行数（不含空行）：6598
+提交页数：60页
+每页行数：50行
+包含源文件：
+  - api/dashboard.py (605 行)
+  - api/data_analytics.py (968 行)
+  - api/economic.py (37 行)
+  - api/innovation.py (136 行)
+  - core/analytics_engine.py (1674 行)
+  - core/economic_engine.py (1310 行)
+  - core/economic_integration.py (111 行)
+  - core/real_data_provider.py (304 行)
+  - core/economic_organism_bridge.py (122 行)
+  - pages/Dashboard.tsx (961 行)
+  - pages/DataAnalytics.tsx (337 行)
+
+格式说明：
+  - Word文档(.docx)格式
+  - 字体：Consolas 10号
+  - 行距：固定15磅
+  - 页边距：上下左右2.5cm
+  - 页眉：软件名称+版本号+页码
+  - 已删除含人名/地址/时间/版权的注释
+  - 每页50行有效代码（不含空行）
+  - 代码超过3000行，提交前30页+后30页

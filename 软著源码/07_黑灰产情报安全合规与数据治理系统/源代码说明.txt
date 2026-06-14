@@ -1,0 +1,29 @@
+软件名称：黑灰产情报安全合规与数据治理系统
+版本号：V1.0
+总代码行数（不含空行）：4353
+提交页数：60页
+每页行数：50行
+包含源文件：
+  - api/compliance.py (148 行)
+  - api/audit_log.py (139 行)
+  - api/dfx.py (654 行)
+  - api/backup.py (123 行)
+  - api/billing.py (108 行)
+  - core/data_masking.py (525 行)
+  - core/data_governance.py (518 行)
+  - core/audit_middleware.py (538 行)
+  - core/dfx.py (429 行)
+  - core/backup.py (375 行)
+  - core/billing.py (345 行)
+  - pages/AuditLog.tsx (198 行)
+  - pages/Settings.tsx (214 行)
+
+格式说明：
+  - Word文档(.docx)格式
+  - 字体：Consolas 10号
+  - 行距：固定15磅
+  - 页边距：上下左右2.5cm
+  - 页眉：软件名称+版本号+页码
+  - 已删除含人名/地址/时间/版权的注释
+  - 每页50行有效代码（不含空行）
+  - 代码超过3000行，提交前30页+后30页

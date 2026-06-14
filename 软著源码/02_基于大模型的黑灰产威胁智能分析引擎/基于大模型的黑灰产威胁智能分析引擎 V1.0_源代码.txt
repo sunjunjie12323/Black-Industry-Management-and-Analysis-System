@@ -1,0 +1,3123 @@
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 1 */
+# ============================================================
+# File: api/deepseek.py
+# ============================================================
+import asyncio
+import hashlib
+import json
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.auth import User, get_current_user, require_role, Role
+from app.core.llm import LLMService, DEEPSEEK_THREAT_INTEL_SYSTEM
+from app.db.database import async_session_factory, get_db
+from app.db.tables import RawIntelligenceTable, CleanedIntelligenceTable, AnalysisResultTable
+router = APIRouter(prefix="/deepseek", tags=["deepseek"])
+class AnalyzeRequest(BaseModel):
+    analysis_type: str = Field(
+        default="classify",
+        description="分析类型: classify/validate/summarize/full",
+    )
+    limit: int = Field(default=20, ge=1, le=50)
+    source: Optional[str] = None
+    threat_level: Optional[str] = None
+class SingleAnalyzeRequest(BaseModel):
+    content: str = Field(..., min_length=1)
+    analysis_type: str = Field(
+        default="full",
+        description="分析类型: classify/validate/summarize/full",
+    )
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    context: Optional[str] = None
+    enable_web_search: bool = Field(default=True, description="是否启用网络搜索获取实时信息")
+    enable_intel_context: bool = Field(default=True, description="是否自动注入项目情报数据作为上下文")
+class SwitchModelRequest(BaseModel):
+    model_id: str = Field(..., min_length=1)
+class CustomModelRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+    provider: str = Field(default="openai_compatible")
+    base_url: str = Field(..., min_length=1)
+    api_key: str = Field(..., min_length=1)
+    model_name: str = Field(..., min_length=1)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=4096, ge=1, le=32768)
+def _get_llm(request: Request) -> LLMService:
+    llm = getattr(request.app.state, "llm", None)
+    if llm is None:
+        raise HTTPException(status_code=503, detail="DeepSeek LLM service not available")
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 2 */
+    return llm
+@router.get("/models")
+async def list_models(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    llm = _get_llm(request)
+    models = llm.list_models()
+    return {"models": models, "total": len(models)}
+@router.post("/models/switch")
+async def switch_model(
+    data: SwitchModelRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    llm = _get_llm(request)
+    success = llm.switch_model(data.model_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Model '{data.model_id}' not found")
+    current = llm.get_current_model()
+    return {"status": "success", "current_model": current}
+@router.post("/models/custom")
+async def add_custom_model(
+    data: CustomModelRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    llm = _get_llm(request)
+    config = {
+        "name": data.name,
+        "provider": data.provider,
+        "base_url": data.base_url,
+        "api_key": data.api_key,
+        "model_name": data.model_name,
+        "temperature": data.temperature,
+        "max_tokens": data.max_tokens,
+    }
+    model_id = llm.add_custom_model(config)
+    return {"status": "success", "model_id": model_id}
+@router.delete("/models/custom/{model_id}")
+async def remove_custom_model(
+    model_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    llm = _get_llm(request)
+    success = llm.remove_custom_model(model_id)
+    if not success:
+        raise HTTPException(
+            status_code=400,
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 3 */
+            detail=f"Cannot remove model '{model_id}'. It may be a preset model, the current active model, or not exist.",
+        )
+    return {"status": "success", "removed": model_id}
+@router.get("/models/current")
+async def get_current_model(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    llm = _get_llm(request)
+    current = llm.get_current_model()
+    return current
+async def _build_intel_context(request: Request, message: str, enable_web_search: bool = True, enable_intel_context: bool = True, db_session=None) -> str:
+    context_parts = []
+    if enable_intel_context:
+        try:
+            if db_session is not None:
+                stmt = select(RawIntelligenceTable).order_by(
+                    RawIntelligenceTable.collected_at.desc()
+                ).limit(5)
+                result = await db_session.execute(stmt)
+                recent_items = result.scalars().all()
+            else:
+                async with async_session_factory() as db:
+                    stmt = select(RawIntelligenceTable).order_by(
+                        RawIntelligenceTable.collected_at.desc()
+                    ).limit(5)
+                    result = await db.execute(stmt)
+                    recent_items = result.scalars().all()
+            if recent_items:
+                lines = ["【系统近期采集的情报数据】"]
+                for i, item in enumerate(recent_items, 1):
+                    content_preview = (item.content or "")[:150]
+                    source = item.source or "未知来源"
+                    threat = item.threat_level or "未评估"
+                    collected = item.collected_at.strftime("%Y-%m-%d %H:%M") if item.collected_at else "未知时间"
+                    lines.append(f"{i}. [{source}|{threat}|{collected}] {content_preview}")
+                context_parts.append("\n".join(lines))
+        except Exception as exc:
+            logger.warning(f"Failed to fetch recent intelligence for chat context: {exc}")
+        try:
+            bt_engine = getattr(request.app.state, "blacktalk_engine", None)
+            if bt_engine:
+                all_terms = await bt_engine.get_all()
+                if all_terms:
+                    lines = ["【系统暗语/黑话库（最新更新）】"]
+                    for t in all_terms[:10]:
+                        lines.append(f"「{t.term}」= {t.meaning}")
+                    context_parts.append("\n".join(lines))
+        except Exception as exc:
+            logger.warning(f"Failed to fetch blacktalk terms for chat context: {exc}")
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 4 */
+        try:
+            kg = getattr(request.app.state, "knowledge_graph", None)
+            if kg:
+                stats = await kg.get_statistics()
+                if stats:
+                    lines = [
+                        "【知识图谱实时数据】",
+                        f"实体总数: {stats.get('node_count', 0)}",
+                        f"关系总数: {stats.get('edge_count', 0)}",
+                    ]
+                    entity_types = stats.get("entity_types", {})
+                    if entity_types:
+                        type_str = ", ".join(f"{k}:{v}" for k, v in list(entity_types.items())[:8])
+                        lines.append(f"实体类型分布: {type_str}")
+                    context_parts.append("\n".join(lines))
+        except Exception as exc:
+            logger.warning(f"Failed to fetch knowledge graph stats for chat context: {exc}")
+    if enable_web_search:
+        try:
+            from app.core.web_search import web_search_service
+            search_query = message
+            if len(message) > 50:
+                search_query = message[:50]
+            results = await web_search_service.search(search_query, max_results=3)
+            if results:
+                search_context = web_search_service.format_results_for_context(results)
+                context_parts.append(search_context)
+        except Exception as exc:
+            logger.warning(f"Web search failed for chat context: {exc}")
+    return "\n\n".join(context_parts) if context_parts else ""
+async def _persist_analysis(
+    analysis_type: str,
+    input_content: str,
+    result: Any,
+    user_id: Optional[str] = None,
+    token_count: int = 0,
+    db_session=None,
+):
+    try:
+        if db_session is not None:
+            content_hash = hashlib.sha256(input_content.encode()).hexdigest()[:16]
+            record = AnalysisResultTable(
+                id=f"ar_{content_hash}_{analysis_type}",
+                analysis_type=analysis_type,
+                input_content=input_content[:2000],
+                result_json=json.dumps(result, ensure_ascii=False, default=str),
+                model_name="deepseek-chat",
+                token_count=token_count,
+                user_id=user_id,
+            )
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 5 */
+            db_session.add(record)
+            await db_session.commit()
+        else:
+            async with async_session_factory() as db:
+                content_hash = hashlib.sha256(input_content.encode()).hexdigest()[:16]
+                record = AnalysisResultTable(
+                    id=f"ar_{content_hash}_{analysis_type}",
+                    analysis_type=analysis_type,
+                    input_content=input_content[:2000],
+                    result_json=json.dumps(result, ensure_ascii=False, default=str),
+                    model_name="deepseek-chat",
+                    token_count=token_count,
+                    user_id=user_id,
+                )
+                db.add(record)
+                await db.commit()
+    except Exception as exc:
+        logger.warning(f"Failed to persist analysis result: {exc}")
+@router.get("/analysis-history")
+async def analysis_history(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    analysis_type: Optional[str] = Query(None, description="筛选分析类型"),
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        stmt = select(AnalysisResultTable).order_by(AnalysisResultTable.created_at.desc())
+        if analysis_type:
+            stmt = stmt.where(AnalysisResultTable.analysis_type == analysis_type)
+        stmt = stmt.offset(offset).limit(limit)
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+        count_stmt = select(func.count(AnalysisResultTable.id))
+        if analysis_type:
+            count_stmt = count_stmt.where(AnalysisResultTable.analysis_type == analysis_type)
+        total = (await db.execute(count_stmt)).scalar() or 0
+        return {
+            "items": [
+                {
+                    "id": r.id,
+                    "analysis_type": r.analysis_type,
+                    "input_content": (r.input_content or "")[:200],
+                    "result_json": r.result_json,
+                    "model_name": r.model_name,
+                    "token_count": r.token_count,
+                    "user_id": r.user_id,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 6 */
+                for r in rows
+            ],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }
+    except Exception as exc:
+        logger.warning(f"Failed to query analysis history: {exc}")
+        return {"items": [], "total": 0, "offset": offset, "limit": limit}
+@router.get("/status")
+async def deepseek_status(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    llm = _get_llm(request)
+    stats = llm.usage_stats
+    return {
+        "status": "online" if llm.api_key and llm.api_key != "sk-your-api-key-here" else "not_configured",
+        "model": stats["model"],
+        "provider": stats["provider"],
+        "request_count": stats["request_count"],
+        "total_tokens": stats["total_tokens"],
+    }
+@router.post("/analyze")
+async def analyze_intelligence(
+    data: AnalyzeRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    llm = _get_llm(request)
+    items = []
+    try:
+        stmt = select(RawIntelligenceTable)
+        if data.source:
+            stmt = stmt.where(RawIntelligenceTable.source == data.source)
+        stmt = stmt.order_by(RawIntelligenceTable.collected_at.desc()).limit(data.limit)
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+        for row in rows:
+            items.append({
+                "id": str(row.id),
+                "content": row.content or "",
+                "source": row.source,
+                "collected_at": row.collected_at.isoformat() if row.collected_at else None,
+            })
+        if len(items) < data.limit:
+            cleaned_stmt = (
+                select(CleanedIntelligenceTable)
+                .order_by(CleanedIntelligenceTable.cleaned_at.desc())
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 7 */
+                .limit(data.limit - len(items))
+            )
+            cleaned_result = await db.execute(cleaned_stmt)
+            cleaned_rows = cleaned_result.scalars().all()
+            for row in cleaned_rows:
+                items.append({
+                    "id": str(row.id),
+                    "content": row.content or "",
+                    "source": "cleaned",
+                    "collected_at": row.cleaned_at.isoformat() if row.cleaned_at else None,
+                })
+    except Exception as exc:
+        logger.warning(f"Failed to load intelligence from DB: {exc}")
+    if not items:
+        raise HTTPException(status_code=404, detail="No intelligence data found for analysis")
+    try:
+        result = await asyncio.wait_for(
+            llm.analyze_intelligence_batch(items, analysis_type=data.analysis_type),
+            timeout=120.0,
+        )
+        await _persist_analysis(
+            analysis_type=data.analysis_type,
+            input_content=json.dumps([i["content"][:200] for i in items], ensure_ascii=False),
+            result=result,
+            user_id=current_user.id,
+            db_session=db,
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="DeepSeek analysis timed out (120s)")
+    except Exception as exc:
+        logger.error(f"DeepSeek analysis failed: {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.post("/analyze-single")
+async def analyze_single(
+    data: SingleAnalyzeRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    llm = _get_llm(request)
+    items = [{"content": data.content}]
+    try:
+        result = await asyncio.wait_for(
+            llm.analyze_intelligence_batch(items, analysis_type=data.analysis_type),
+            timeout=60.0,
+        )
+        await _persist_analysis(
+            analysis_type=f"single_{data.analysis_type}",
+            input_content=data.content[:2000],
+            result=result,
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 8 */
+            user_id=current_user.id,
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="DeepSeek analysis timed out")
+    except Exception as exc:
+        logger.error(f"DeepSeek single analysis failed: {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.post("/chat")
+async def deepseek_chat(
+    data: ChatRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    llm = _get_llm(request)
+    auto_context = await _build_intel_context(
+        request,
+        data.message,
+        enable_web_search=data.enable_web_search,
+        enable_intel_context=data.enable_intel_context,
+        db_session=db,
+    )
+    context_parts = []
+    if auto_context:
+        context_parts.append(auto_context)
+    if data.context:
+        context_parts.append(f"用户补充上下文：\n{data.context[:2000]}")
+    context_str = ""
+    if context_parts:
+        context_str = "\n\n".join(context_parts)
+    prompt = f"{data.message}"
+    if context_str:
+        prompt = f"{data.message}\n\n以下是为你提供的实时参考数据，请结合这些数据回答用户问题：\n{context_str}"
+    system_msg = (
+        DEEPSEEK_THREAT_INTEL_SYSTEM
+        + "\n\n你现在拥有实时数据能力：\n"
+        "1. 系统会自动为你提供最近采集的情报数据、暗语库、知识图谱统计等实时信息\n"
+        "2. 系统会自动为你搜索网络获取最新信息\n"
+        "3. 你必须优先使用这些实时数据来回答问题，而不是依赖自身训练数据\n"
+        "4. 如果实时数据与你的训练知识有冲突，以实时数据为准\n"
+        "5. 回答时请说明信息来源（如'根据系统最新情报'或'根据网络搜索结果'）\n\n"
+        "回答要求：使用纯文本格式，不要使用Markdown语法（如##、**、-等），直接用中文标点和换行组织内容。回答要简洁明了，普通人也能看懂。"
+    )
+    data_sources = []
+    if data.enable_intel_context:
+        data_sources.append("项目情报")
+    if data.enable_web_search:
+        data_sources.append("网络搜索")
+    try:
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 9 */
+        response = await asyncio.wait_for(
+            llm.generate(
+                prompt=prompt,
+                system_prompt=system_msg,
+                temperature=0.3,
+                max_tokens=2048,
+            ),
+            timeout=60.0,
+        )
+        return {
+            "status": "success",
+            "response": response,
+            "data_sources": data_sources,
+            "context_used": bool(context_str),
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="DeepSeek chat timed out")
+    except Exception as exc:
+        logger.error(f"DeepSeek chat failed: {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.post("/chat-stream")
+async def deepseek_chat_stream(
+    data: ChatRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from fastapi.responses import StreamingResponse
+    llm = _get_llm(request)
+    auto_context = await _build_intel_context(
+        request,
+        data.message,
+        enable_web_search=data.enable_web_search,
+        enable_intel_context=data.enable_intel_context,
+        db_session=db,
+    )
+    context_parts = []
+    if auto_context:
+        context_parts.append(auto_context)
+    if data.context:
+        context_parts.append(f"用户补充上下文：\n{data.context[:2000]}")
+    context_str = ""
+    if context_parts:
+        context_str = "\n\n".join(context_parts)
+    prompt = f"{data.message}"
+    if context_str:
+        prompt = f"{data.message}\n\n以下是为你提供的实时参考数据，请结合这些数据回答用户问题：\n{context_str}"
+    system_msg = (
+        DEEPSEEK_THREAT_INTEL_SYSTEM
+        + "\n\n你现在拥有实时数据能力：\n"
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 10 */
+        "1. 系统会自动为你提供最近采集的情报数据、暗语库、知识图谱统计等实时信息\n"
+        "2. 系统会自动为你搜索网络获取最新信息\n"
+        "3. 你必须优先使用这些实时数据来回答问题，而不是依赖自身训练数据\n"
+        "4. 如果实时数据与你的训练知识有冲突，以实时数据为准\n"
+        "5. 回答时请说明信息来源（如'根据系统最新情报'或'根据网络搜索结果'）\n\n"
+        "回答要求：使用纯文本格式，不要使用Markdown语法（如##、**、-等），直接用中文标点和换行组织内容。回答要简洁明了，普通人也能看懂。"
+    )
+    async def generate():
+        try:
+            async for chunk in llm.generate_stream(
+                prompt=prompt,
+                system_prompt=system_msg,
+                temperature=0.3,
+            ):
+                yield f"data: {chunk}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as stream_exc:
+            logger.error(f"LLM stream error: {stream_exc}")
+            try:
+                yield f'data: {{"type": "error", "content": "生成中断: {str(stream_exc)}"}}\n\n'
+            except Exception:
+                pass
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+@router.get("/category-summary")
+async def category_summary(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(30, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    llm = _get_llm(request)
+    items = []
+    try:
+        stmt = (
+            select(RawIntelligenceTable)
+            .order_by(RawIntelligenceTable.collected_at.desc())
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+        for row in rows:
+            items.append({
+                "content": (row.content or "")[:500],
+                "source": row.source,
+            })
+    except Exception as exc:
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 11 */
+        logger.warning(f"Failed to load data for category summary: {exc}")
+    if not items:
+        return {"status": "error", "message": "No data available"}
+    try:
+        result = await asyncio.wait_for(
+            llm.analyze_intelligence_batch(items, analysis_type="classify"),
+            timeout=120.0,
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Category summary timed out")
+    except Exception as exc:
+        logger.error(f"Category summary failed: {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.get("/validate-data")
+async def validate_data(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(20, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    llm = _get_llm(request)
+    items = []
+    try:
+        stmt = (
+            select(RawIntelligenceTable)
+            .order_by(RawIntelligenceTable.collected_at.desc())
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+        for row in rows:
+            items.append({
+                "content": (row.content or "")[:500],
+                "source": row.source,
+            })
+    except Exception as exc:
+        logger.warning(f"Failed to load data for validation: {exc}")
+    if not items:
+        return {"status": "error", "message": "No data available"}
+    try:
+        result = await asyncio.wait_for(
+            llm.analyze_intelligence_batch(items, analysis_type="validate"),
+            timeout=120.0,
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Validation timed out")
+    except Exception as exc:
+        logger.error(f"Data validation failed: {exc}")
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 12 */
+        raise HTTPException(status_code=500, detail="操作失败")
+class TranslateRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    source_lang: str = Field(default="auto", description="源语言: auto/zh/en/ru")
+    target_lang: str = Field(default="zh", description="目标语言: zh/en")
+@router.post("/translate")
+async def translate_blacktalk(
+    data: TranslateRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    llm = _get_llm(request)
+    bt = getattr(request.app.state, "blacktalk", None)
+    glossary_context = ""
+    if bt:
+        try:
+            terms = bt.terms if hasattr(bt, "terms") else []
+            if terms:
+                sample = terms[:30]
+                glossary_lines = [f"「{t.term}」= {t.meaning}" for t in sample if hasattr(t, "term") and hasattr(t, "meaning")]
+                if glossary_lines:
+                    glossary_context = f"\n\n参考黑话术语库（共{len(terms)}个术语，以下为部分示例）：\n" + "\n".join(glossary_lines)
+        except Exception:
+            pass
+    prompt = (
+        f"请将以下文本中的黑灰产黑话/暗语翻译为标准语言，并解释其含义。\n"
+        f"源语言: {data.source_lang}，目标语言: {data.target_lang}\n"
+        f"如果文本中包含黑话，请：\n"
+        f"1. 逐个识别黑话术语\n"
+        f"2. 给出标准翻译\n"
+        f"3. 解释黑话在黑灰产链条中的角色和用途\n\n"
+        f"返回JSON：\n"
+        f'{{"original_text": "...", "translated_text": "...", "terms": [{{"term": "...", "translation": "...", '
+        f'"role_in_chain": "..."}}], "overall_meaning": "..."}}\n\n'
+        f"待翻译文本：\n{data.text}{glossary_context}\n\n"
+        f"重要：翻译结果使用纯文本格式，不要使用Markdown语法（如##、**、-等），直接用中文标点和换行组织内容。"
+    )
+    try:
+        result = await asyncio.wait_for(
+            llm.generate_json(prompt=prompt, system_prompt=DEEPSEEK_THREAT_INTEL_SYSTEM, temperature=0.1),
+            timeout=60.0,
+        )
+        return {"status": "success", "data": result}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Translation timed out")
+    except Exception as exc:
+        logger.error(f"Translation failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+class BriefRequest(BaseModel):
+    limit: int = Field(default=20, ge=1, le=50)
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 13 */
+    title: Optional[str] = None
+@router.post("/generate-brief")
+async def generate_brief(
+    data: BriefRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    llm = _get_llm(request)
+    items = []
+    try:
+        stmt = (
+            select(RawIntelligenceTable)
+            .order_by(RawIntelligenceTable.collected_at.desc())
+            .limit(data.limit)
+        )
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+        for row in rows:
+            items.append({
+                "content": (row.content or "")[:500],
+                "source": row.source,
+                "collected_at": row.collected_at.isoformat() if row.collected_at else None,
+            })
+    except Exception as exc:
+        logger.warning(f"Failed to load data for brief: {exc}")
+    if not items:
+        raise HTTPException(status_code=404, detail="No data available for brief generation")
+    combined = "\n---\n".join(f"[情报{i+1}] {c['content']}" for i, c in enumerate(items))
+    title = data.title or "黑灰产威胁情报简报"
+    prompt = (
+        f"请基于以下{len(items)}条情报数据，生成一份专业的威胁情报简报。\n\n"
+        f"简报标题：{title}\n\n"
+        f"简报要求：\n"
+        f"1. 概述：当前威胁态势总体评估（100-200字）\n"
+        f"2. 关键发现：列出3-5个最重要的发现\n"
+        f"3. 威胁分类统计：各类威胁的数量和占比\n"
+        f"4. 高危情报：标注可靠性≥0.7的高危条目\n"
+        f"5. 攻击趋势：近期攻击手法和目标的变化趋势\n"
+        f"6. 防御建议：针对当前威胁的3-5条防御建议\n"
+        f"7. 可靠性评估：数据整体可信度评估\n\n"
+        f"返回JSON：\n"
+        f'{{"title": "...", "overview": "...", "key_findings": ["..."], '
+        f'"threat_statistics": {{"fraud": 0, "hacking": 0}}, '
+        f'"high_risk_items": [{{"index": 1, "threat": "...", "reliability": 0.0}}], '
+        f'"attack_trends": ["..."], "defense_recommendations": ["..."], '
+        f'"overall_reliability": 0.0-1.0, "generated_at": "..."}}\n\n'
+        f"情报数据：\n{combined}\n\n"
+        f"重要：所有文本内容使用纯文本格式，不要使用Markdown语法（如##、**、-等），直接用中文标点和换行组织内容。"
+    )
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 14 */
+    try:
+        result = await asyncio.wait_for(
+            llm.generate_json(prompt=prompt, system_prompt=DEEPSEEK_THREAT_INTEL_SYSTEM, temperature=0.2),
+            timeout=120.0,
+        )
+        return {"status": "success", "data": result}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Brief generation timed out")
+    except Exception as exc:
+        logger.error(f"Brief generation failed: {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.get("/prompt-experiment")
+async def prompt_experiment(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    test_text: str = Query("某黑客组织声称攻击了银行数据库，获取500万用户信息"),
+):
+    llm = _get_llm(request)
+    results = {}
+    baseline_prompt = f"分析以下情报的威胁类别和等级：\n{test_text}"
+    try:
+        baseline = await asyncio.wait_for(
+            llm.generate(prompt=baseline_prompt, system_prompt="", temperature=0.3, max_tokens=512),
+            timeout=30.0,
+        )
+        results["baseline"] = {"prompt_type": "通用prompt", "response": baseline[:500]}
+    except Exception as exc:
+        results["baseline"] = {"prompt_type": "通用prompt", "error": str(exc)}
+    few_shot_prompt = (
+        "以下是黑灰产情报分类的示例：\n"
+        "示例1: 「某钓鱼网站仿冒银行登录页面」→ 类别: phishing, 等级: high\n"
+        "示例2: 「暗网出售100万条个人信息，0.5BTC」→ 类别: data_theft, 等级: critical\n"
+        "示例3: 「新型跑分平台利用虚拟货币洗钱」→ 类别: money_laundering, 等级: high\n\n"
+        f"请按相同格式分析：\n{test_text}"
+    )
+    try:
+        few_shot = await asyncio.wait_for(
+            llm.generate(prompt=few_shot_prompt, system_prompt=DEEPSEEK_THREAT_INTEL_SYSTEM, temperature=0.1, max_tokens=512),
+            timeout=30.0,
+        )
+        results["few_shot"] = {"prompt_type": "Few-shot黑产专属prompt", "response": few_shot[:500]}
+    except Exception as exc:
+        results["few_shot"] = {"prompt_type": "Few-shot黑产专属prompt", "error": str(exc)}
+    cot_prompt = (
+        f"请逐步分析以下情报：\n"
+        f"步骤1: 识别情报中的关键实体和动作\n"
+        f"步骤2: 判断威胁类别（fraud/gambling/hacking/money_laundering/data_theft/phishing/ransomware/other）\n"
+        f"步骤3: 评估威胁等级（critical/high/medium/low/info）\n"
+        f"步骤4: 评估信息可靠性（0-1）\n"
+        f"步骤5: 给出最终结论\n\n"
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 15 */
+        f"情报内容：{test_text}"
+    )
+    try:
+        cot = await asyncio.wait_for(
+            llm.generate(prompt=cot_prompt, system_prompt=DEEPSEEK_THREAT_INTEL_SYSTEM, temperature=0.1, max_tokens=512),
+            timeout=30.0,
+        )
+        results["chain_of_thought"] = {"prompt_type": "CoT链式思维prompt", "response": cot[:500]}
+    except Exception as exc:
+        results["chain_of_thought"] = {"prompt_type": "CoT链式思维prompt", "error": str(exc)}
+    return {
+        "status": "success",
+        "test_text": test_text,
+        "experiment_results": results,
+        "conclusion": "对比三种prompt策略：baseline(通用) vs few-shot(黑产示例) vs CoT(链式思维)",
+    }
+# ============================================================
+# File: api/threat_analysis.py
+# ============================================================
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.auth import User, get_current_user
+from app.core.db_utils import db_write
+from app.db.database import get_db
+router = APIRouter(prefix="/threat-analysis", tags=["黑灰产情报分析"])
+class AnalyzeRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=50000, description="待分析的情报文本")
+    intelligence_id: Optional[str] = Field(None, description="情报ID")
+    industry: Optional[str] = Field(None, description="行业场景: threat_intel/manufacturing/education/healthcare/finance")
+    use_llm: bool = Field(True, description="是否使用LLM增强分析")
+class ClassifyRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=50000)
+    use_llm: bool = Field(True)
+class ExtractRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=50000)
+    use_llm: bool = Field(True)
+class BatchAnalyzeRequest(BaseModel):
+    texts: List[str] = Field(..., min_length=1, max_length=20)
+    industry: Optional[str] = None
+@router.post("/analyze")
+async def analyze_intelligence(request: AnalyzeRequest, req: Request, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    service = getattr(req.app.state, "threat_intel_service", None)
+    if not service:
+        raise HTTPException(status_code=503, detail="ThreatIntelService未初始化")
+    result = await service.analyze(request.text, request.intelligence_id or "", request.industry or "")
+    if result is None:
+        raise HTTPException(status_code=500, detail="分析服务返回空结果，请稍后重试")
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 16 */
+    summary = getattr(result, 'analysis_summary', None) or ""
+    threat_categories = getattr(result, 'threat_categories', None) or []
+    confidence = getattr(result, 'confidence', None)
+    if confidence is None:
+        summary_dict = getattr(result, 'summary', None) or {}
+        if isinstance(summary_dict, dict):
+            threat_categories = summary_dict.get('threats', threat_categories)
+        else:
+            threat_categories = getattr(summary_dict, 'threats', threat_categories)
+        confidence = getattr(result, 'confidence', 0.0)
+    try:
+        from app.db.tables import AnalysisResultTable
+        from uuid import uuid4
+        entry = AnalysisResultTable(
+            id=uuid4().hex,
+            analysis_type="threat_analysis",
+            target_id=request.intelligence_id or "",
+            result_summary=summary,
+            findings_json=threat_categories if isinstance(threat_categories, str) else str(threat_categories),
+            confidence_score=confidence if isinstance(confidence, (int, float)) else 0.0,
+            input_content=request.text[:2000],
+            model_name="deepseek-chat",
+        )
+        async with db_write(db, operation="保存分析结果"):
+            db.add(entry)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to save analysis result to database: {e}")
+    return result.to_dict()
+@router.post("/classify")
+async def classify_threat(request: ClassifyRequest, req: Request, current_user: User = Depends(get_current_user)):
+    service = getattr(req.app.state, "threat_intel_service", None)
+    if not service:
+        raise HTTPException(status_code=503, detail="ThreatIntelService未初始化")
+    result = await service.classify_only(request.text)
+    if result is None:
+        raise HTTPException(status_code=500, detail="分类服务返回空结果，请稍后重试")
+    return result.to_dict()
+@router.post("/extract-entities")
+async def extract_entities(request: ExtractRequest, req: Request, current_user: User = Depends(get_current_user)):
+    service = getattr(req.app.state, "threat_intel_service", None)
+    if not service:
+        raise HTTPException(status_code=503, detail="ThreatIntelService未初始化")
+    result = await service.extract_entities_only(request.text)
+    if result is None or (isinstance(result, list) and len(result) == 0):
+        return {"entities": [], "total": 0}
+    entities = []
+    for e in result:
+        try:
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 17 */
+            entities.append(e.to_dict() if hasattr(e, 'to_dict') else {"value": str(e)})
+        except Exception:
+            entities.append({"value": str(e)})
+    return {"entities": entities, "total": len(entities)}
+@router.post("/batch-analyze")
+async def batch_analyze(request: BatchAnalyzeRequest, req: Request, current_user: User = Depends(get_current_user)):
+    service = getattr(req.app.state, "threat_intel_service", None)
+    if not service:
+        raise HTTPException(status_code=503, detail="ThreatIntelService未初始化")
+    import asyncio
+    semaphore = asyncio.Semaphore(5)
+    async def _analyze_one(text: str):
+        async with semaphore:
+            return await service.analyze(text, "", request.industry or "")
+    tasks = [_analyze_one(text) for text in request.texts[:20]]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    output = []
+    for r in results:
+        if isinstance(r, Exception):
+            output.append({"error": "分析失败，请稍后重试"})
+        else:
+            output.append(r.to_dict())
+    return {"results": output, "total": len(output)}
+@router.get("/statistics")
+async def get_statistics(req: Request, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import select, func, case
+    from app.db.tables import AnalysisResultTable, AnalyzedIntelligenceTable
+    now = datetime.now(timezone.utc)
+    twenty_four_hours_ago = now - timedelta(hours=24)
+    try:
+        type_counts_stmt = (
+            select(AnalysisResultTable.analysis_type, func.count(AnalysisResultTable.id))
+            .group_by(AnalysisResultTable.analysis_type)
+        )
+        type_result = await db.execute(type_counts_stmt)
+        analysis_counts_by_type = {row[0]: row[1] for row in type_result.all()}
+        threat_level_stmt = (
+            select(AnalyzedIntelligenceTable.threat_level, func.count(AnalyzedIntelligenceTable.id))
+            .group_by(AnalyzedIntelligenceTable.threat_level)
+        )
+        level_result = await db.execute(threat_level_stmt)
+        threat_level_distribution = {row[0]: row[1] for row in level_result.all()}
+        recent_stmt = (
+            select(func.count(AnalysisResultTable.id))
+            .where(AnalysisResultTable.analyzed_at >= twenty_four_hours_ago)
+        )
+        recent_result = await db.execute(recent_stmt)
+        recent_activity_count = recent_result.scalar() or 0
+    except Exception as e:
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 18 */
+        logger.error(f"Failed to query statistics: {e}")
+        analysis_counts_by_type = {}
+        threat_level_distribution = {}
+        recent_activity_count = 0
+    return {
+        "analysis_counts_by_type": analysis_counts_by_type,
+        "threat_level_distribution": threat_level_distribution,
+        "recent_activity_count": recent_activity_count,
+    }
+@router.get("/threat-categories")
+async def get_threat_categories(req: Request, current_user: User = Depends(get_current_user)):
+    service = getattr(req.app.state, "threat_intel_service", None)
+    if not service:
+        raise HTTPException(status_code=503, detail="ThreatIntelService未初始化")
+    return service.get_threat_categories()
+@router.get("/entity-types")
+async def get_entity_types(req: Request, current_user: User = Depends(get_current_user)):
+    service = getattr(req.app.state, "threat_intel_service", None)
+    if not service:
+        raise HTTPException(status_code=503, detail="ThreatIntelService未初始化")
+    return service.get_entity_types()
+@router.get("/industries")
+async def get_industries(req: Request, current_user: User = Depends(get_current_user)):
+    service = getattr(req.app.state, "threat_intel_service", None)
+    if not service:
+        raise HTTPException(status_code=503, detail="ThreatIntelService未初始化")
+    industries = service.get_all_industries()
+    return {
+        k: {
+            "name": v["name"],
+            "threat_focus": v["threat_focus"],
+            "keywords": v["keywords"],
+        }
+        for k, v in industries.items()
+    }
+@router.get("/industries/{industry}")
+async def get_industry_detail(industry: str, req: Request, current_user: User = Depends(get_current_user)):
+    service = getattr(req.app.state, "threat_intel_service", None)
+    if not service:
+        raise HTTPException(status_code=503, detail="ThreatIntelService未初始化")
+    config = service.get_industry_config(industry)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"行业 {industry} 不存在")
+    return config
+@router.get("/recent")
+async def get_recent_analyses(
+    req: Request,
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user),
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 19 */
+    db: AsyncSession = Depends(get_db),
+):
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+    from app.db.tables import AnalysisResultTable
+    try:
+        stmt = (
+            select(AnalysisResultTable)
+            .order_by(AnalysisResultTable.analyzed_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+        items = []
+        for row in rows:
+            items.append({
+                "id": row.id,
+                "analysis_type": row.analysis_type,
+                "target_id": row.target_id,
+                "result_summary": row.result_summary,
+                "confidence_score": row.confidence_score,
+                "model_name": row.model_name,
+                "analyzed_at": row.analyzed_at.isoformat() if row.analyzed_at else None,
+            })
+        return {"items": items, "total": len(items), "offset": offset, "limit": limit}
+    except Exception as e:
+        logger.error(f"Failed to get recent analyses: {e}")
+        return {"items": [], "total": 0, "offset": offset, "limit": limit}
+# ============================================================
+# File: api/attack_prediction.py
+# ============================================================
+import asyncio
+from typing import Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from app.core.auth import User, get_current_user, require_role, Role
+from app.core.attack_chain_predictor import AttackChainPredictor, MITRE_TECHNIQUES
+router = APIRouter(prefix="/attack-prediction", tags=["attack-prediction"])
+class PredictRequest(BaseModel):
+    entity_id: str = Field(..., min_length=1)
+    depth: int = Field(default=3, ge=1, le=10)
+class SimulateRequest(BaseModel):
+    entity_id: str = Field(..., min_length=1)
+    steps: int = Field(default=5, ge=1, le=20)
+class PredictByNameRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+    depth: int = Field(default=3, ge=1, le=10)
+class EarlyWarningRequest(BaseModel):
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 20 */
+    entity_id: str = Field(..., min_length=1)
+def get_attack_chain_predictor(request: Request) -> AttackChainPredictor | None:
+    return getattr(request.app.state, "attack_chain_predictor", None)
+@router.post("/predict")
+async def predict_next_steps(
+    data: PredictRequest,
+    request: Request,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    predictor = get_attack_chain_predictor(request)
+    if predictor is None:
+        raise HTTPException(status_code=503, detail="Attack chain predictor not available")
+    try:
+        result = await asyncio.wait_for(
+            predictor.predict_next_steps(data.entity_id, depth=data.depth),
+            timeout=60,
+        )
+        return result.to_dict()
+    except asyncio.TimeoutError:
+        logger.error(f"Attack prediction timed out for entity '{data.entity_id}'")
+        raise HTTPException(status_code=504, detail="Attack prediction timed out")
+    except Exception as exc:
+        logger.error(f"Attack prediction failed for entity '{data.entity_id}': {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.post("/predict-by-name")
+async def predict_by_name(
+    data: PredictByNameRequest,
+    request: Request,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    kg = getattr(request.app.state, "knowledge_graph", None)
+    if kg is None:
+        raise HTTPException(status_code=503, detail="Knowledge graph not available")
+    entity = None
+    for e in kg._entities.values():
+        if e.value.lower() == data.name.lower():
+            entity = e
+            break
+    if not entity:
+        results = await kg.search_entities(data.name, limit=1)
+        if results:
+            entity = results[0]
+    if not entity:
+        raise HTTPException(status_code=404, detail=f"Entity not found: {data.name}")
+    entity_id = entity.id
+    predictor = get_attack_chain_predictor(request)
+    try:
+        result = await asyncio.wait_for(
+            predictor.predict_next_steps(entity_id, depth=data.depth),
+            timeout=60,
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 21 */
+        )
+        return {
+            "entity_id": entity_id,
+            "entity_name": entity.value,
+            "predictions": result.to_dict(),
+        }
+    except asyncio.TimeoutError:
+        logger.error(f"Attack prediction timed out for entity '{entity_id}'")
+        raise HTTPException(status_code=504, detail="Attack prediction timed out")
+    except Exception as exc:
+        logger.error(f"Attack prediction failed for entity '{entity_id}': {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.post("/simulate")
+async def simulate_attack_chain(
+    data: SimulateRequest,
+    request: Request,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    predictor = get_attack_chain_predictor(request)
+    if predictor is None:
+        raise HTTPException(status_code=503, detail="Attack chain predictor not available")
+    try:
+        result = await asyncio.wait_for(
+            predictor.simulate_attack_chain(data.entity_id, steps=data.steps),
+            timeout=60,
+        )
+        return result.to_dict()
+    except asyncio.TimeoutError:
+        logger.error(f"Attack chain simulation timed out for entity '{data.entity_id}'")
+        raise HTTPException(status_code=504, detail="Attack chain simulation timed out")
+    except Exception as exc:
+        logger.error(f"Attack chain simulation failed for entity '{data.entity_id}': {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.post("/early-warning")
+async def find_early_warning_signals(
+    data: EarlyWarningRequest,
+    request: Request,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    predictor = get_attack_chain_predictor(request)
+    if predictor is None:
+        raise HTTPException(status_code=503, detail="Attack chain predictor not available")
+    try:
+        prediction = await asyncio.wait_for(
+            predictor.predict_next_steps(data.entity_id, depth=3),
+            timeout=60,
+        )
+        warnings = await asyncio.wait_for(
+            predictor.find_early_warning_signals(prediction),
+            timeout=60,
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 22 */
+        )
+        return {
+            "warnings": [w.to_dict() for w in warnings],
+            "total_signals": len(warnings),
+        }
+    except asyncio.TimeoutError:
+        logger.error(f"Early warning analysis timed out for entity '{data.entity_id}'")
+        raise HTTPException(status_code=504, detail="Early warning analysis timed out")
+    except Exception as exc:
+        logger.error(f"Early warning analysis failed for entity '{data.entity_id}': {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.get("/visualization")
+async def get_visualization(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    predictor = get_attack_chain_predictor(request)
+    knowledge_graph = getattr(request.app.state, "knowledge_graph", None)
+    nodes = []
+    edges = []
+    tactics_set = set()
+    for tech_id, tech_info in MITRE_TECHNIQUES.items():
+        tactic = tech_info.get("tactic", "unknown")
+        risk = tech_info.get("risk", "medium")
+        tactics_set.add(tactic)
+        nodes.append({
+            "id": tech_id,
+            "label": tech_info.get("name", tech_id),
+            "type": "technique",
+            "tactic": tactic,
+            "risk": risk,
+            "probability": 0.0,
+        })
+    if knowledge_graph is not None:
+        try:
+            for entity_id, entity in knowledge_graph._entities.items():
+                entity_type = entity.type.value if hasattr(entity.type, "value") else str(entity.type)
+                nodes.append({
+                    "id": entity_id,
+                    "label": entity.value,
+                    "type": "entity",
+                    "tactic": entity_type,
+                    "risk": "medium",
+                    "probability": 0.0,
+                })
+        except Exception as exc:
+            logger.warning(f"Failed to read knowledge graph entities for visualization: {exc}")
+    if predictor is not None:
+        try:
+            transition_counts = predictor._transition_counts
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 23 */
+            for src_tactic, dst_map in transition_counts.items():
+                total = sum(dst_map.values())
+                if total == 0:
+                    continue
+                for dst_tactic, count in dst_map.items():
+                    if count > 0:
+                        prob = round(count / total, 4)
+                        edges.append({
+                            "source": src_tactic,
+                            "target": dst_tactic,
+                            "probability": prob,
+                            "label": f"{prob:.2f}",
+                        })
+        except Exception as exc:
+            logger.warning(f"Failed to read transition counts for visualization: {exc}")
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "tactics": sorted(tactics_set),
+    }
+@router.get("/top-predictions")
+async def top_predictions(
+    request: Request,
+    limit: int = Query(default=10, ge=1, le=50),
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST, Role.VIEWER)),
+):
+    kg = request.app.state.knowledge_graph
+    acp = request.app.state.attack_chain_predictor
+    if kg is None or acp is None:
+        raise HTTPException(status_code=503, detail="Services not available")
+    try:
+        entities = list(kg._entities.values())
+        scored = []
+        for e in entities:
+            degree = kg.graph.degree(e.id) if e.id in kg.graph else 0
+            scored.append((e, degree))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        llm = getattr(request.app.state, "llm_service", None)
+        llm_ok = llm is not None and hasattr(llm, "is_available") and llm.is_available
+        sem = asyncio.Semaphore(3)
+        results = []
+        async def _predict_one(entity, degree):
+            async with sem:
+                try:
+                    pred = await asyncio.wait_for(
+                        acp.predict_next_steps(entity.id, depth=3),
+                        timeout=30 if llm_ok else 10,
+                    )
+                    results.append({
+                        "entity_id": entity.id,
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 24 */
+                        "entity_type": entity.type.value,
+                        "entity_value": entity.value,
+                        "degree": degree,
+                        "predictions": [{"technique": p.technique_id, "name": p.technique_name, "probability": p.probability} for p in pred.predictions[:5]],
+                    })
+                except asyncio.TimeoutError:
+                    logger.warning(f"Prediction timed out for entity {entity.id}")
+                except Exception as exc:
+                    logger.warning(f"Prediction failed for entity {entity.id}: {exc}")
+        tasks = [_predict_one(entity, degree) for entity, degree in scored[:limit]]
+        await asyncio.gather(*tasks)
+        return {"total": len(results), "predictions": results}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.get("/predictions")
+async def get_predictions_alias(
+    request: Request,
+    limit: int = Query(default=10, ge=1, le=50),
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST, Role.VIEWER)),
+):
+    return await top_predictions(request, limit, current_user)
+@router.get("/stats")
+async def get_attack_prediction_stats(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    predictor = get_attack_chain_predictor(request)
+    kg = getattr(request.app.state, "knowledge_graph", None)
+    stats = {
+        "total_entities": len(kg._entities) if kg else 0,
+        "total_techniques": len(MITRE_TECHNIQUES),
+        "total_transitions": predictor._total_transitions if predictor else 0,
+        "predictor_available": predictor is not None,
+        "knowledge_graph_available": kg is not None,
+    }
+    return stats
+# ============================================================
+# File: api/zero_day.py
+# ============================================================
+import asyncio
+from typing import Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.auth import User, get_current_user, require_role, Role
+from app.core.zero_day_detector import ZeroDayDetector
+from app.db.database import get_db
+from app.db.tables import RawIntelligenceTable
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 25 */
+router = APIRouter(prefix="/zero-day", tags=["zero-day"])
+class ZeroDayDetectRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=50000)
+def get_zero_day_detector(request: Request) -> ZeroDayDetector | None:
+    return getattr(request.app.state, "zero_day_detector", None)
+@router.post("/detect")
+async def detect_zero_day_terms(
+    data: ZeroDayDetectRequest,
+    request: Request,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    detector = get_zero_day_detector(request)
+    if detector is None:
+        raise HTTPException(status_code=503, detail="Zero-day detector not available")
+    try:
+        zero_day_terms = await asyncio.wait_for(
+            detector.detect_zero_day_terms(data.text),
+            timeout=60,
+        )
+        known_count = 0
+        try:
+            decode_result = await detector.blacktalk_engine.decode(data.text)
+            if isinstance(decode_result, dict):
+                known_count = decode_result.get("terms_found", 0)
+            elif hasattr(decode_result, 'terms_found'):
+                known_count = decode_result.terms_found
+        except Exception:
+            pass
+        return {
+            "zero_day_terms": [t.to_dict() for t in zero_day_terms],
+            "known_terms_count": known_count,
+            "total_analyzed": len(zero_day_terms) + known_count,
+        }
+    except asyncio.TimeoutError:
+        logger.error("Zero-day detection timed out")
+        raise HTTPException(status_code=504, detail="Zero-day detection timed out")
+    except Exception as exc:
+        logger.error(f"Zero-day detection failed: {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.get("/drift/{term}")
+async def track_semantic_drift(
+    term: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    detector = get_zero_day_detector(request)
+    if detector is None:
+        raise HTTPException(status_code=503, detail="Zero-day detector not available")
+    try:
+        result = await asyncio.wait_for(
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 26 */
+            detector.track_semantic_drift(term),
+            timeout=60,
+        )
+        return result.to_dict()
+    except asyncio.TimeoutError:
+        logger.error(f"Semantic drift analysis timed out for term '{term}'")
+        raise HTTPException(status_code=504, detail="Semantic drift analysis timed out")
+    except Exception as exc:
+        logger.error(f"Semantic drift analysis failed for term '{term}': {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+@router.get("/migration/{term}")
+async def track_cross_platform_migration(
+    term: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    detector = get_zero_day_detector(request)
+    if detector is None:
+        raise HTTPException(status_code=503, detail="Zero-day detector not available")
+    try:
+        result = await asyncio.wait_for(
+            detector.track_cross_platform_migration(term),
+            timeout=60,
+        )
+        return result.to_dict()
+    except asyncio.TimeoutError:
+        logger.error(f"Cross-platform migration analysis timed out for term '{term}'")
+        raise HTTPException(status_code=504, detail="Cross-platform migration analysis timed out")
+    except Exception as exc:
+        logger.error(f"Cross-platform migration analysis failed for term '{term}': {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.post("/scan-intelligence")
+async def scan_intelligence(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+    db: AsyncSession = Depends(get_db),
+):
+    detector = request.app.state.zero_day_detector
+    if detector is None:
+        raise HTTPException(status_code=503, detail="Zero day detector not available")
+    llm = getattr(request.app.state, "llm_service", None)
+    llm_ok = llm is not None and hasattr(llm, "is_available") and llm.is_available
+    try:
+        result = await db.execute(
+            select(RawIntelligenceTable).order_by(RawIntelligenceTable.collected_at.desc()).limit(limit)
+        )
+        intels = result.scalars().all()
+        all_detections = []
+        scanned = 0
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 27 */
+        sem = asyncio.Semaphore(3)
+        async def _scan_one(intel):
+            nonlocal scanned
+            async with sem:
+                content = intel.content or ""
+                if not content or len(content) < 10:
+                    scanned += 1
+                    return
+                try:
+                    result = await asyncio.wait_for(
+                        detector.detect_zero_day_terms(content),
+                        timeout=15 if llm_ok else 8,
+                    )
+                    if result and result.get("detected_terms"):
+                        for term in result["detected_terms"]:
+                            all_detections.append({
+                                "intelligence_id": intel.id,
+                                "term": term.get("term", ""),
+                                "score": term.get("score", 0),
+                                "context": term.get("context", "")[:100],
+                            })
+                    scanned += 1
+                except asyncio.TimeoutError:
+                    logger.warning(f"Zero-day scan timed out for intel {intel.id}")
+                    scanned += 1
+                except Exception:
+                    scanned += 1
+        tasks = [_scan_one(intel) for intel in intels]
+        await asyncio.gather(*tasks)
+        all_detections.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return {"scanned": scanned, "detections": len(all_detections), "results": all_detections[:30]}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+@router.get("/recent-detections")
+async def get_recent_detections(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    detector = get_zero_day_detector(request)
+    if detector is None:
+        raise HTTPException(status_code=503, detail="Zero-day detector not available")
+    llm = getattr(request.app.state, "llm_service", None)
+    llm_ok = llm is not None and hasattr(llm, "is_available") and llm.is_available
+    try:
+        result = await db.execute(
+            select(RawIntelligenceTable).order_by(RawIntelligenceTable.collected_at.desc()).limit(limit)
+        )
+        intels = result.scalars().all()
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 28 */
+        detections = []
+        drift_results = []
+        blacktalk_terms = list(detector.blacktalk_engine._dictionary.keys())[:5] if detector.blacktalk_engine else []
+        sem = asyncio.Semaphore(3)
+        async def _detect_one(intel):
+            async with sem:
+                content = intel.content or ""
+                if not content or len(content) < 10:
+                    return
+                try:
+                    zterms = await asyncio.wait_for(
+                        detector.detect_zero_day_terms(content),
+                        timeout=15 if llm_ok else 8,
+                    )
+                    for t in zterms:
+                        detections.append({
+                            "intelligence_id": intel.id,
+                            "source": intel.source,
+                            "term": t.term,
+                            "score": t.confidence,
+                            "context": t.context[:100] if t.context else "",
+                        })
+                except asyncio.TimeoutError:
+                    logger.warning(f"Zero-day detection timed out for intel {intel.id}")
+                except Exception:
+                    pass
+        tasks = [_detect_one(intel) for intel in intels[:limit]]
+        await asyncio.gather(*tasks)
+        if llm_ok:
+            for term_id in blacktalk_terms:
+                bt = detector.blacktalk_engine._dictionary.get(term_id)
+                if bt and bt.term:
+                    try:
+                        drift = await asyncio.wait_for(
+                            detector.track_semantic_drift(bt.term),
+                            timeout=10,
+                        )
+                        drift_results.append({
+                            "term": bt.term,
+                            "original_meaning": drift.original_meaning,
+                            "current_meaning": drift.current_meaning,
+                            "drift_velocity": drift.drift_velocity,
+                            "timeline_count": len(drift.drift_timeline),
+                        })
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Semantic drift timed out for term '{bt.term}'")
+                    except Exception:
+                        pass
+        detections.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return {
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 29 */
+            "detections": detections[:limit],
+            "drift_results": drift_results,
+            "total_detections": len(detections),
+            "total_intel_scanned": len(intels),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.get("/vulnerabilities")
+async def get_vulnerabilities_alias(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+):
+    return await get_recent_detections(request, limit, current_user)
+# ============================================================
+# File: api/attribution.py
+# ============================================================
+import asyncio
+from typing import Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from app.core.auth import User, get_current_user, require_role, Role
+from app.core.entity_attribution import EntityAttribution
+router = APIRouter(prefix="/attribution", tags=["attribution"])
+def get_entity_attribution(request: Request) -> EntityAttribution | None:
+    return getattr(request.app.state, "entity_attribution", None)
+@router.post("/fingerprint/{entity_id}")
+async def compute_behavioral_fingerprint(
+    entity_id: str,
+    request: Request,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    attribution = get_entity_attribution(request)
+    if attribution is None:
+        raise HTTPException(status_code=503, detail="Entity attribution not available")
+    try:
+        fingerprint = await asyncio.wait_for(
+            attribution.compute_behavioral_fingerprint(entity_id),
+            timeout=60,
+        )
+        return fingerprint.to_dict()
+    except asyncio.TimeoutError:
+        logger.error(f"Behavioral fingerprint computation timed out for entity '{entity_id}'")
+        raise HTTPException(status_code=504, detail="Behavioral fingerprint computation timed out")
+    except Exception as exc:
+        logger.error(f"Behavioral fingerprint computation failed for entity '{entity_id}': {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.get("/find-same/{entity_id}")
+async def find_same_entity(
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 30 */
+    entity_id: str,
+    threshold: float = Query(default=0.7, ge=0.0, le=1.0),
+    request: Request = None,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    attribution = get_entity_attribution(request)
+    if attribution is None:
+        raise HTTPException(status_code=503, detail="Entity attribution not available")
+    try:
+        matches = await asyncio.wait_for(
+            attribution.find_same_entity(entity_id, threshold=threshold),
+            timeout=60,
+        )
+        all_entity_ids = [
+            eid for eid in attribution.knowledge_graph._entities
+            if eid != entity_id
+        ]
+        return {
+            "matches": [m.to_dict() for m in matches],
+            "total_compared": len(all_entity_ids),
+        }
+    except asyncio.TimeoutError:
+        logger.error(f"Same entity search timed out for entity '{entity_id}'")
+        raise HTTPException(status_code=504, detail="Same entity search timed out")
+    except Exception as exc:
+        logger.error(f"Same entity search failed for entity '{entity_id}': {exc}")
+        raise HTTPException(status_code=500, detail="操作失败")
+@router.get("/find-same-by-name/{name}")
+async def find_same_entity_by_name(
+    name: str,
+    threshold: float = Query(default=0.7, ge=0.0, le=1.0),
+    request: Request = None,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    kg = getattr(request.app.state, "knowledge_graph", None)
+    if kg is None:
+        raise HTTPException(status_code=503, detail="Knowledge graph not available")
+    entity = None
+    for e in kg._entities.values():
+        if e.value.lower() == name.lower():
+            entity = e
+            break
+    if not entity:
+        results = await kg.search_entities(name, limit=1)
+        if results:
+            entity = results[0]
+    if not entity:
+        raise HTTPException(status_code=404, detail=f"Entity not found: {name}")
+    entity_id = entity.id
+    attribution = get_entity_attribution(request)
+
+/* ............................................................ 中间代码省略 ............................................................ */
+
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 31 */
+                    documents=[content],
+                    metadatas=[sanitized],
+                )
+            logger.debug(f"Added intelligence vector: {intel_id}")
+        except Exception as exc:
+            logger.error(f"Failed to add intelligence vector {intel_id}: {exc}")
+            raise
+    async def search(
+        self,
+        query: str,
+        n_results: int = 10,
+        collection: str = "intelligence",
+        filter: Optional[dict] = None,
+    ) -> List[dict]:
+        col = self._get_collection(collection)
+        try:
+            query_embedding = await self._embed(query)
+            kwargs = {
+                "query_embeddings": [query_embedding],
+                "n_results": n_results,
+            }
+            if filter:
+                kwargs["where"] = filter
+            results = col.query(**kwargs)
+            return self._format_results(results)
+        except Exception as exc:
+            logger.error(f"Failed to search {collection}: {exc}")
+            return []
+    async def search_intelligence(
+        self,
+        query: str,
+        n_results: int = 10,
+        filter: Optional[dict] = None,
+    ) -> List[dict]:
+        try:
+            query_embedding = await self._embed(query)
+            kwargs = {
+                "query_embeddings": [query_embedding],
+                "n_results": n_results,
+            }
+            if filter:
+                kwargs["where"] = filter
+            results = self._collections["intelligence"].query(**kwargs)
+            return self._format_results(results)
+        except Exception as exc:
+            logger.error(f"Failed to search intelligence: {exc}")
+            return []
+    async def add_entity(self, entity_id: str, content: str, metadata: dict):
+        try:
+            embedding = await self._embed(content)
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 32 */
+            sanitized = self._sanitize_metadata(metadata)
+            async with self._get_lock("entities"):
+                self._collections["entities"].add(
+                    ids=[entity_id],
+                    embeddings=[embedding],
+                    documents=[content],
+                    metadatas=[sanitized],
+                )
+            logger.debug(f"Added entity vector: {entity_id}")
+        except Exception as exc:
+            logger.error(f"Failed to add entity vector {entity_id}: {exc}")
+            raise
+    async def search_entities(
+        self,
+        query: str,
+        n_results: int = 10,
+    ) -> List[dict]:
+        try:
+            query_embedding = await self._embed(query)
+            results = self._collections["entities"].query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+            )
+            return self._format_results(results)
+        except Exception as exc:
+            logger.error(f"Failed to search entities: {exc}")
+            return []
+    async def add_blacktalk(self, term_id: str, content: str, metadata: dict):
+        try:
+            embedding = await self._embed(content)
+            sanitized = self._sanitize_metadata(metadata)
+            async with self._get_lock("blacktalk"):
+                self._collections["blacktalk"].add(
+                    ids=[term_id],
+                    embeddings=[embedding],
+                    documents=[content],
+                    metadatas=[sanitized],
+                )
+            logger.debug(f"Added blacktalk vector: {term_id}")
+        except Exception as exc:
+            logger.error(f"Failed to add blacktalk vector {term_id}: {exc}")
+            raise
+    async def search_blacktalk(
+        self,
+        query: str,
+        n_results: int = 10,
+    ) -> List[dict]:
+        try:
+            query_embedding = await self._embed(query)
+            results = self._collections["blacktalk"].query(
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 33 */
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+            )
+            return self._format_results(results)
+        except Exception as exc:
+            logger.error(f"Failed to search blacktalk: {exc}")
+            return []
+    async def delete(self, collection: str, ids: List[str]):
+        try:
+            col = self._get_collection(collection)
+            async with self._get_lock(collection):
+                col.delete(ids=ids)
+            logger.debug(f"Deleted {len(ids)} items from {collection}")
+        except Exception as exc:
+            logger.error(f"Failed to delete from {collection}: {exc}")
+            raise
+    async def count(self, collection: str) -> int:
+        try:
+            col = self._get_collection(collection)
+            return col.count()
+        except Exception as exc:
+            logger.error(f"Failed to count {collection}: {exc}")
+            return 0
+    async def persist(self):
+        try:
+            backup_data = {
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "collections": {},
+            }
+            for name, col in self._collections.items():
+                try:
+                    count = col.count()
+                    if count == 0:
+                        backup_data["collections"][name] = {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
+                        continue
+                    results = col.get(include=["documents", "metadatas", "embeddings"])
+                    backup_data["collections"][name] = {
+                        "ids": results.get("ids", []),
+                        "documents": results.get("documents", []),
+                        "metadatas": results.get("metadatas", []),
+                        "embeddings": results.get("embeddings", []),
+                    }
+                except Exception as exc:
+                    logger.warning(f"Failed to export collection {name} for backup: {exc}")
+                    backup_data["collections"][name] = {"error": "向量存储操作失败"}
+            self._json_backup_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                suffix=".tmp",
+                prefix=self.PERSIST_FILENAME,
+                dir=str(self._json_backup_path.parent),
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 34 */
+            )
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                    json.dump(backup_data, f, ensure_ascii=False, default=str)
+                os.replace(tmp_path, str(self._json_backup_path))
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
+            total = sum(
+                len(c.get("ids", []))
+                for c in backup_data["collections"].values()
+                if isinstance(c, dict) and "ids" in c
+            )
+            logger.info(f"VectorStore JSON backup saved: {total} total records across {len(self._collections)} collections")
+        except Exception as exc:
+            logger.error(f"Failed to persist VectorStore JSON backup: {exc}")
+    def _load_from_json(self):
+        if not self._json_backup_path.exists():
+            logger.debug("No VectorStore JSON backup found, relying on ChromaDB persistence")
+            return
+        try:
+            with open(self._json_backup_path, "r", encoding="utf-8") as f:
+                backup_data = json.load(f)
+            collections_data = backup_data.get("collections", {})
+            if not isinstance(collections_data, dict):
+                return
+            total_restored = 0
+            for name in self.COLLECTION_NAMES:
+                col_data = collections_data.get(name)
+                if not col_data or not isinstance(col_data, dict) or "ids" not in col_data:
+                    continue
+                ids = col_data.get("ids", [])
+                if not ids:
+                    continue
+                existing = set(self._collections[name].get().get("ids", []))
+                new_ids = [i for i in ids if i not in existing]
+                if not new_ids:
+                    continue
+                idx_map = {i: idx for idx, i in enumerate(ids)}
+                documents = [col_data["documents"][idx_map[i]] for i in new_ids if i in idx_map and idx_map[i] < len(col_data.get("documents", []))]
+                metadatas = [col_data["metadatas"][idx_map[i]] for i in new_ids if i in idx_map and idx_map[i] < len(col_data.get("metadatas", []))]
+                embeddings = [col_data["embeddings"][idx_map[i]] for i in new_ids if i in idx_map and idx_map[i] < len(col_data.get("embeddings", []))]
+                if len(new_ids) != len(documents) or len(new_ids) != len(metadatas) or len(new_ids) != len(embeddings):
+                    logger.warning(f"VectorStore JSON backup for '{name}' has mismatched lengths, skipping")
+                    continue
+                try:
+                    self._collections[name].add(
+                        ids=new_ids,
+                        documents=documents,
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 35 */
+                        metadatas=metadatas,
+                        embeddings=embeddings,
+                    )
+                    total_restored += len(new_ids)
+                except Exception as exc:
+                    logger.warning(f"Failed to restore collection '{name}' from JSON backup: {exc}")
+            if total_restored > 0:
+                logger.info(f"VectorStore restored {total_restored} records from JSON backup")
+            else:
+                logger.debug("VectorStore JSON backup contained no new records to restore")
+        except Exception as exc:
+            logger.warning(f"Failed to load VectorStore JSON backup: {exc}")
+    def get_status(self) -> Dict:
+        collection_info = {}
+        for name, col in self._collections.items():
+            try:
+                count = col.count()
+                collection_info[name] = {"document_count": count}
+            except Exception:
+                collection_info[name] = {"document_count": 0, "error": True}
+        return {
+            "persist_dir": self.persist_dir,
+            "collections": list(self._collections.keys()),
+            "collection_details": collection_info,
+            "embedding_dim": self._embedding.dim,
+        }
+    def _format_results(self, results: dict) -> List[dict]:
+        formatted = []
+        if not results or not results.get("ids") or not results["ids"][0]:
+            return formatted
+        ids = results["ids"][0]
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+        for i in range(len(ids)):
+            item = {
+                "id": ids[i],
+                "document": documents[i] if i < len(documents) else None,
+                "metadata": metadatas[i] if i < len(metadatas) else {},
+                "distance": distances[i] if i < len(distances) else None,
+            }
+            formatted.append(item)
+        return formatted
+# ============================================================
+# File: engine/analysis_engine.py
+# ============================================================
+import asyncio
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 36 */
+from loguru import logger
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from app.core.llm import LLMService
+from app.core.zero_day_detector import ZeroDayDetector
+from app.core.entity_attribution import EntityAttribution
+from app.core.provenance_chain import ProvenanceChain
+from app.core.temporal_decay import TemporalDecay
+from app.core.attack_chain_predictor import AttackChainPredictor
+from app.core.knowledge_graph import KnowledgeGraph
+from app.db.analysis_crud import AnalysisResultCRUD
+from app.engine.analyzers.base import BaseAnalyzer
+from app.engine.analyzers.zero_day import ZeroDayAnalyzer
+from app.engine.analyzers.attribution import AttributionAnalyzer
+from app.engine.analyzers.provenance import ProvenanceAnalyzer
+from app.engine.analyzers.decay import DecayAnalyzer
+from app.engine.analyzers.attack_prediction import AttackPredictionAnalyzer
+from app.engine.report_generator import ReportGenerator
+class AnalysisEngine:
+    def __init__(
+        self,
+        llm_client: LLMService,
+        db_session_factory: async_sessionmaker,
+        zero_day_detector: ZeroDayDetector,
+        entity_attribution: EntityAttribution,
+        provenance_chain: ProvenanceChain,
+        temporal_decay: TemporalDecay,
+        attack_predictor: AttackChainPredictor,
+        knowledge_graph: KnowledgeGraph,
+        max_concurrent: int = 5,
+    ):
+        self.llm_client = llm_client
+        self.db_session_factory = db_session_factory
+        self.knowledge_graph = knowledge_graph
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._analyzers: Dict[str, BaseAnalyzer] = {
+            "zero_day": ZeroDayAnalyzer(llm_client, db_session_factory, zero_day_detector),
+            "attribution": AttributionAnalyzer(llm_client, db_session_factory, entity_attribution),
+            "provenance": ProvenanceAnalyzer(llm_client, db_session_factory, provenance_chain),
+            "decay": DecayAnalyzer(llm_client, db_session_factory, temporal_decay),
+            "attack_prediction": AttackPredictionAnalyzer(llm_client, db_session_factory, attack_predictor),
+        }
+        self._report_generator = ReportGenerator(llm_client, db_session_factory)
+        self._running = False
+    async def run_analysis_cycle(self, enabled_types: Optional[List[str]] = None) -> Dict[str, Any]:
+        if self._running:
+            logger.warning("Analysis cycle already running, skipping")
+            return {"status": "skipped", "message": "已有分析周期在运行"}
+        self._running = True
+        start_time = datetime.now(timezone.utc)
+        all_results = []
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 37 */
+        processed = 0
+        errors = 0
+        try:
+            since = await self._get_last_analyzed_time()
+            targets = await self._get_pending_targets(since)
+            logger.info(f"Analysis cycle: {len(targets)} targets to analyze (since: {since})")
+            for target in targets:
+                try:
+                    result = await self._analyze_target(target, enabled_types)
+                    if result:
+                        all_results.extend(result)
+                    processed += 1
+                except Exception as exc:
+                    logger.error(f"Target analysis failed: {exc}")
+                    errors += 1
+            if all_results:
+                try:
+                    report_ids = await self._report_generator.generate_from_results(all_results)
+                    logger.info(f"Generated {len(report_ids)} reports from analysis results")
+                except Exception as exc:
+                    logger.error(f"Report generation failed: {exc}")
+            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+            logger.info(f"Analysis cycle completed: {processed} targets, {len(all_results)} results, {errors} errors, {duration:.1f}s")
+            return {"status": "completed", "targets_processed": processed, "results_count": len(all_results), "errors": errors, "duration_seconds": duration}
+        finally:
+            self._running = False
+    async def run_single_analysis(self, target_id: str, target_type: str, analysis_type: str) -> Optional[Dict]:
+        analyzer = self._analyzers.get(analysis_type)
+        if not analyzer:
+            logger.error(f"Unknown analysis type: {analysis_type}")
+            return None
+        async with self._semaphore:
+            return await analyzer.analyze(target_id, target_type)
+    async def _get_last_analyzed_time(self) -> Optional[datetime]:
+        try:
+            async with self.db_session_factory() as session:
+                return await AnalysisResultCRUD.get_last_analyzed_time(session)
+        except Exception:
+            return None
+    async def _get_pending_targets(self, since: Optional[datetime] = None) -> List[Dict]:
+        from app.db.tables import RawIntelligenceTable, EntityTable
+        from sqlalchemy import select
+        targets = []
+        try:
+            async with self.db_session_factory() as session:
+                q = select(RawIntelligenceTable).where(RawIntelligenceTable.content != "").order_by(RawIntelligenceTable.collected_at.desc())
+                if since:
+                    q = q.where(RawIntelligenceTable.collected_at > since)
+                q = q.limit(100)
+                result = await session.execute(q)
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 38 */
+                for row in result.scalars().all():
+                    targets.append({"id": row.id, "type": "intelligence"})
+                eq = select(EntityTable).order_by(EntityTable.last_seen.desc()).limit(50)
+                entity_result = await session.execute(eq)
+                for row in entity_result.scalars().all():
+                    targets.append({"id": row.id, "type": "entity"})
+        except Exception as exc:
+            logger.error(f"Failed to get pending targets: {exc}")
+        return targets
+    async def _analyze_target(self, target: Dict, enabled_types: Optional[List[str]] = None) -> List[Dict]:
+        target_id = target["id"]
+        target_type = target["type"]
+        types_to_run = enabled_types or list(self._analyzers.keys())
+        results = []
+        for atype in types_to_run:
+            analyzer = self._analyzers.get(atype)
+            if not analyzer:
+                continue
+            async with self._semaphore:
+                try:
+                    result = await self._with_retry(analyzer.analyze(target_id, target_type))
+                    if result:
+                        results.append({"analysis_type": atype, "target_id": target_id, **result})
+                except Exception as exc:
+                    logger.error(f"Analysis {atype} failed for {target_id}: {exc}")
+        return results
+    async def _with_retry(self, coro, max_retries: int = 3):
+        delays = [5, 15, 45]
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await coro
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    delay = delays[attempt] if attempt < len(delays) else 45
+                    logger.warning(f"Retry {attempt+1}/{max_retries} after {delay}s: {exc}")
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+# ============================================================
+# File: engine/deep_analysis.py
+# ============================================================
+import json
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from loguru import logger
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from app.core.llm import LLMService
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 39 */
+from app.core.knowledge_graph import KnowledgeGraph
+from app.db.analysis_crud import AnalysisResultCRUD
+from app.engine.prompts.deep_analysis_prompts import DEEP_ANALYSIS_SYSTEM_PROMPT
+from app.engine.web_search import WebSearchService
+from app.schemas.analysis import DeepAnalysisRequest, DeepAnalysisResponse
+class DeepAnalysisService:
+    def __init__(self, llm_client: LLMService, web_search_service: WebSearchService, db_session_factory: async_sessionmaker, knowledge_graph: KnowledgeGraph):
+        self.llm_client = llm_client
+        self.web_search_service = web_search_service
+        self.db_session_factory = db_session_factory
+        self.knowledge_graph = knowledge_graph
+    async def deep_analyze(self, request: DeepAnalysisRequest) -> DeepAnalysisResponse:
+        web_context = ""
+        data_sources = ["local_database"]
+        if request.include_web_search:
+            try:
+                search_results = await self.web_search_service.search(request.target_identifier, request.search_keywords)
+                web_context = self._format_search_results(search_results)
+                if search_results:
+                    data_sources.append("web_search")
+            except Exception as exc:
+                logger.warning(f"Web search failed, continuing with local data: {exc}")
+                web_context = "联网搜索不可用，基于本地数据分析"
+        local_data = await self._query_local_intelligence(request.target_identifier)
+        graph_relations = await self._query_graph_relations(request.target_identifier)
+        if graph_relations:
+            data_sources.append("knowledge_graph")
+        prompt = self._build_deep_analysis_prompt(request.target_identifier, local_data, web_context, graph_relations)
+        try:
+            llm_result = await self.llm_client.generate_json(prompt=prompt, system_prompt=DEEP_ANALYSIS_SYSTEM_PROMPT, temperature=0.3)
+        except Exception as exc:
+            logger.error(f"Deep analysis LLM call failed: {exc}")
+            llm_result = {
+                "threat_assessment": f"深度分析部分完成（LLM不可用）: {str(exc)[:100]}",
+                "related_threats": [],
+                "risk_indicators": [],
+                "recommended_actions": ["请稍后重试深度分析"],
+                "confidence_score": 0.1,
+                "data_sources_used": data_sources,
+            }
+        result_id = uuid.uuid4().hex[:16]
+        try:
+            async with self.db_session_factory() as session:
+                await AnalysisResultCRUD.create(session, {
+                    "analysis_type": "deep_analysis",
+                    "target_id": request.target_identifier,
+                    "target_type": request.target_type,
+                    "result_summary": llm_result.get("threat_assessment", "")[:500],
+                    "findings": llm_result.get("related_threats", []),
+                    "iocs": [],
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 40 */
+                    "recommendations": llm_result.get("recommended_actions", []),
+                    "result_data": llm_result,
+                    "confidence_score": llm_result.get("confidence_score", 0.0),
+                    "status": "completed",
+                    "model_name": self.llm_client.model_name,
+                    "input_content": request.target_identifier[:500],
+                })
+        except Exception as exc:
+            logger.warning(f"Failed to persist deep analysis result: {exc}")
+        return DeepAnalysisResponse(
+            result_id=result_id,
+            threat_assessment=llm_result.get("threat_assessment", ""),
+            related_threats=llm_result.get("related_threats", []),
+            risk_indicators=llm_result.get("risk_indicators", []),
+            recommended_actions=llm_result.get("recommended_actions", []),
+            confidence_score=llm_result.get("confidence_score", 0.0),
+            data_sources_used=data_sources,
+        )
+    async def _query_local_intelligence(self, target_identifier: str) -> str:
+        from app.db.tables import RawIntelligenceTable
+        from sqlalchemy import select
+        try:
+            async with self.db_session_factory() as session:
+                result = await session.execute(
+                    select(RawIntelligenceTable).where(RawIntelligenceTable.content.contains(target_identifier)).limit(5)
+                )
+                rows = result.scalars().all()
+                if not rows:
+                    return "本地未找到相关情报"
+                return "\n---\n".join([f"[情报{i+1}] {(r.content or '')[:300]}" for i, r in enumerate(rows)])
+        except Exception:
+            return "本地情报查询失败"
+    async def _query_graph_relations(self, target_identifier: str) -> str:
+        try:
+            kg = self.knowledge_graph
+            if not kg.graph.nodes:
+                return "知识图谱为空"
+            matching = [nid for nid, ndata in kg.graph.nodes(data=True) if target_identifier in str(ndata.get("value", ""))]
+            if not matching:
+                return "知识图谱中未找到匹配实体"
+            relations = []
+            for nid in matching[:3]:
+                for neighbor in kg.graph.neighbors(nid):
+                    edge = kg.graph.edges[nid, neighbor]
+                    relations.append(f"实体{nid[:8]} -> {neighbor[:8]} (类型: {edge.get('type', 'unknown')}, 置信度: {edge.get('confidence', 0)})")
+            return "\n".join(relations[:10]) if relations else "无关联关系"
+        except Exception:
+            return "知识图谱查询失败"
+    def _format_search_results(self, results) -> str:
+        if not results:
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 41 */
+            return "联网搜索无结果"
+        lines = []
+        for r in results[:10]:
+            lines.append(f"- [{r.source}] {r.title}: {r.snippet[:150]}")
+        return "\n".join(lines)
+    def _build_deep_analysis_prompt(self, target: str, local_data: str, web_context: str, graph_relations: str) -> str:
+        return (
+            f"请对以下目标进行深度威胁情报分析：\n\n"
+            f"分析目标：{target}\n\n"
+            f"=== 本地情报数据 ===\n{local_data}\n\n"
+            f"=== 联网搜索结果 ===\n{web_context}\n\n"
+            f"=== 知识图谱关联 ===\n{graph_relations}\n\n"
+            f"请综合以上所有信息源，进行深度研判分析。"
+        )
+# ============================================================
+# File: engine/analyzers/attack_prediction.py
+# ============================================================
+from typing import Dict
+from loguru import logger
+from app.core.llm import LLMService
+from app.core.attack_chain_predictor import AttackChainPredictor
+from app.engine.analyzers.base import BaseAnalyzer
+from app.engine.prompts.attack_prediction_prompts import ATTACK_PREDICTION_SYSTEM_PROMPT
+from sqlalchemy.ext.asyncio import async_sessionmaker
+class AttackPredictionAnalyzer(BaseAnalyzer):
+    analysis_type = "attack_prediction"
+    def __init__(self, llm_client: LLMService, db_session_factory: async_sessionmaker, attack_predictor: AttackChainPredictor):
+        super().__init__(llm_client, db_session_factory)
+        self.attack_predictor = attack_predictor
+        self._system_prompt = ATTACK_PREDICTION_SYSTEM_PROMPT
+    async def _rule_based_analyze(self, target_data: Dict) -> Dict:
+        entity_id = target_data.get("id", "")
+        try:
+            predictions = await self.attack_predictor.predict_next_steps(entity_id, depth=3)
+            pred_data = [p.to_dict() if hasattr(p, "to_dict") else str(p) for p in predictions]
+            try:
+                warnings = await self.attack_predictor.find_early_warning_signals(predictions)
+                warn_data = [w.to_dict() if hasattr(w, "to_dict") else str(w) for w in warnings[:10]]
+            except Exception:
+                warn_data = []
+            findings = pred_data[:5]
+            avg_prob = sum(p.probability for p in predictions) / len(predictions) if predictions else 0.0
+            summary = f"攻击预测完成：{len(predictions)}个预测步骤，{len(warn_data)}个预警信号，平均概率{avg_prob:.2f}"
+            return {
+                "result_summary": summary,
+                "findings": findings,
+                "confidence_score": avg_prob,
+                "status": "completed",
+                "iocs": [],
+                "recommendations": ["关注高概率攻击步骤", "加强早期预警监控"] if avg_prob > 0.5 else [],
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 42 */
+                "result_data": {"predictions": pred_data, "early_warnings": warn_data, "avg_probability": round(avg_prob, 4)},
+                "input_content": target_data.get("value", target_data.get("content", ""))[:2000],
+            }
+        except Exception as exc:
+            logger.warning(f"AttackPrediction rule analysis error: {exc}")
+            return {"result_summary": f"攻击预测: {entity_id}", "findings": [], "confidence_score": 0.1, "status": "completed", "iocs": [], "recommendations": [], "result_data": {}, "input_content": target_data.get("value", "")[:500]}
+    def _should_enhance_with_llm(self, rule_result: Dict) -> bool:
+        return rule_result.get("confidence_score", 0) < 0.6
+    def _build_prompt(self, target_data: Dict, rule_result: Dict) -> str:
+        value = target_data.get("value", target_data.get("content", ""))[:2000]
+        findings = rule_result.get("findings", [])
+        findings_text = "\n".join([str(f) for f in findings[:5]])
+        return f"请基于MITRE ATT&CK框架预测以下实体的下一步攻击行为：\n\n实体信息：{value}\n\n已有预测结果：\n{findings_text}\n\n请补充可能的攻击步骤和早期预警信号。"
+    def _merge_results(self, rule_result: Dict, llm_result: Dict) -> Dict:
+        merged = rule_result.copy()
+        if isinstance(llm_result, dict):
+            if llm_result.get("predicted_next_steps"):
+                existing = rule_result.get("result_data", {}).get("predictions", [])
+                new_steps = llm_result["predicted_next_steps"]
+                merged["result_data"] = {**rule_result.get("result_data", {}), "llm_predictions": new_steps, "predictions": existing + new_steps}
+            if llm_result.get("early_warning_indicators"):
+                merged["result_data"]["llm_warnings"] = llm_result["early_warning_indicators"]
+            if llm_result.get("defensive_recommendations"):
+                merged["recommendations"] = list(set(rule_result.get("recommendations", []) + llm_result["defensive_recommendations"]))
+            merged["result_summary"] += " [LLM补充预测]"
+        return merged
+# ============================================================
+# File: engine/analyzers/zero_day.py
+# ============================================================
+from typing import Dict
+from loguru import logger
+from app.core.llm import LLMService
+from app.core.zero_day_detector import ZeroDayDetector
+from app.engine.analyzers.base import BaseAnalyzer
+from app.engine.prompts.zero_day_prompts import ZERO_DAY_SYSTEM_PROMPT
+from sqlalchemy.ext.asyncio import async_sessionmaker
+class ZeroDayAnalyzer(BaseAnalyzer):
+    analysis_type = "zero_day"
+    def __init__(self, llm_client: LLMService, db_session_factory: async_sessionmaker, zero_day_detector: ZeroDayDetector):
+        super().__init__(llm_client, db_session_factory)
+        self.zero_day_detector = zero_day_detector
+        self._system_prompt = ZERO_DAY_SYSTEM_PROMPT
+    async def _rule_based_analyze(self, target_data: Dict) -> Dict:
+        content = target_data.get("content", "")
+        if len(content) < 10:
+            return {"result_summary": "内容过短，跳过0日检测", "findings": [], "confidence_score": 0.0, "status": "skipped", "iocs": [], "recommendations": [], "result_data": {}}
+        try:
+            if not self.zero_day_detector._trained:
+                return {"result_summary": "0日检测器未训练，跳过规则检测", "findings": [], "confidence_score": 0.0, "status": "skipped", "iocs": [], "recommendations": [], "result_data": {}}
+            result = await self.zero_day_detector.detect_zero_day_terms(content)
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 43 */
+            zero_day_terms = result.get("zero_day_terms", [])
+            known_count = result.get("known_terms_count", 0)
+            total = result.get("total_analyzed", 0)
+            findings = [t.to_dict() if hasattr(t, "to_dict") else t for t in zero_day_terms]
+            is_likely = len(zero_day_terms) > 0
+            confidence = min(0.3 + len(zero_day_terms) * 0.15, 0.9) if is_likely else 0.1
+            summary = f"检测到{len(zero_day_terms)}个疑似0日术语，已知术语{known_count}个/共分析{total}个"
+            return {
+                "result_summary": summary,
+                "findings": findings,
+                "confidence_score": confidence,
+                "status": "completed",
+                "iocs": [],
+                "recommendations": ["关注疑似0日术语的后续披露", "监控相关漏洞情报"] if is_likely else [],
+                "result_data": {"zero_day_terms_count": len(zero_day_terms), "known_terms_count": known_count, "total_analyzed": total, "is_zero_day_likely": is_likely},
+                "input_content": content[:2000],
+            }
+        except Exception as exc:
+            logger.warning(f"ZeroDay rule analysis error: {exc}")
+            return {"result_summary": f"规则检测异常: {str(exc)[:100]}", "findings": [], "confidence_score": 0.0, "status": "completed", "iocs": [], "recommendations": [], "result_data": {}}
+    def _should_enhance_with_llm(self, rule_result: Dict) -> bool:
+        if rule_result.get("status") == "skipped":
+            return False
+        data = rule_result.get("result_data", {})
+        return data.get("is_zero_day_likely", False) or rule_result.get("confidence_score", 0) >= 0.3
+    def _build_prompt(self, target_data: Dict, rule_result: Dict) -> str:
+        content = target_data.get("content", "")[:3000]
+        findings = rule_result.get("findings", [])
+        findings_text = "\n".join([str(f) for f in findings[:5]])
+        return f"请分析以下威胁情报是否描述了0日漏洞特征：\n\n情报内容：\n{content}\n\n规则检测已发现：\n{findings_text}\n\n请综合判断此情报是否涉及0日漏洞。"
+    def _merge_results(self, rule_result: Dict, llm_result: Dict) -> Dict:
+        merged = rule_result.copy()
+        if isinstance(llm_result, dict):
+            if llm_result.get("is_zero_day_likely"):
+                merged["confidence_score"] = min(rule_result.get("confidence_score", 0.3) + 0.2, 1.0)
+                merged["result_summary"] += " [LLM确认可能为0日]"
+            merged["result_data"] = {**rule_result.get("result_data", {}), "llm_analysis": llm_result}
+            if llm_result.get("recommendations"):
+                merged["recommendations"] = list(set(rule_result.get("recommendations", []) + llm_result["recommendations"]))
+        return merged
+# ============================================================
+# File: engine/analyzers/attribution.py
+# ============================================================
+from typing import Dict
+from loguru import logger
+from app.core.llm import LLMService
+from app.core.entity_attribution import EntityAttribution
+from app.engine.analyzers.base import BaseAnalyzer
+from app.engine.prompts.attribution_prompts import ATTRIBUTION_SYSTEM_PROMPT
+from sqlalchemy.ext.asyncio import async_sessionmaker
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 44 */
+class AttributionAnalyzer(BaseAnalyzer):
+    analysis_type = "attribution"
+    def __init__(self, llm_client: LLMService, db_session_factory: async_sessionmaker, entity_attribution: EntityAttribution):
+        super().__init__(llm_client, db_session_factory)
+        self.entity_attribution = entity_attribution
+        self._system_prompt = ATTRIBUTION_SYSTEM_PROMPT
+    async def _rule_based_analyze(self, target_data: Dict) -> Dict:
+        entity_id = target_data.get("id", "")
+        try:
+            fingerprint = await self.entity_attribution.compute_behavioral_fingerprint(entity_id)
+            same_entities = await self.entity_attribution.find_same_entity(entity_id, threshold=0.7)
+            findings = []
+            for r in same_entities:
+                d = r.to_dict() if hasattr(r, "to_dict") else {"source": r.source_entity_id, "target": r.target_entity_id, "similarity": r.similarity}
+                findings.append(d)
+            avg_sim = sum(r.similarity for r in same_entities) / len(same_entities) if same_entities else 0.0
+            summary = f"实体溯源分析完成：发现{len(same_entities)}个同源实体，平均相似度{avg_sim:.2f}"
+            fp_dict = fingerprint.to_dict() if hasattr(fingerprint, "to_dict") else str(fingerprint)
+            return {
+                "result_summary": summary,
+                "findings": findings,
+                "confidence_score": min(avg_sim + 0.1, 1.0),
+                "status": "completed",
+                "iocs": [],
+                "recommendations": ["对同源实体进行关联分析", "更新实体指纹库"] if same_entities else [],
+                "result_data": {"fingerprint": fp_dict, "same_entity_count": len(same_entities), "avg_similarity": round(avg_sim, 4)},
+                "input_content": target_data.get("value", "")[:500],
+            }
+        except Exception as exc:
+            logger.warning(f"Attribution rule analysis error: {exc}")
+            return {"result_summary": f"溯源分析: 实体{entity_id}", "findings": [], "confidence_score": 0.1, "status": "completed", "iocs": [], "recommendations": [], "result_data": {}, "input_content": target_data.get("value", "")[:500]}
+    def _should_enhance_with_llm(self, rule_result: Dict) -> bool:
+        data = rule_result.get("result_data", {})
+        avg_sim = data.get("avg_similarity", 0)
+        return 0.7 <= avg_sim <= 0.9
+    def _build_prompt(self, target_data: Dict, rule_result: Dict) -> str:
+        findings = rule_result.get("findings", [])
+        findings_text = "\n".join([str(f) for f in findings[:5]])
+        return f"请验证以下同源实体匹配是否合理：\n\n源实体：{target_data.get('value', '')} (类型: {target_data.get('type', '')})\n\n同源匹配结果：\n{findings_text}\n\n请判断这些实体是否确实属于同一威胁行为者。"
+    def _merge_results(self, rule_result: Dict, llm_result: Dict) -> Dict:
+        merged = rule_result.copy()
+        if isinstance(llm_result, dict):
+            adj = llm_result.get("confidence_adjustment", 0)
+            if adj:
+                merged["confidence_score"] = min(max(rule_result.get("confidence_score", 0.5) + (adj - 0.5) * 0.3, 0), 1.0)
+            merged["result_data"] = {**rule_result.get("result_data", {}), "llm_verification": llm_result}
+            if llm_result.get("evidence_summary"):
+                merged["result_summary"] += f" [LLM: {llm_result['evidence_summary'][:100]}]"
+        return merged
+# ============================================================
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 45 */
+# File: engine/analyzers/provenance.py
+# ============================================================
+from typing import Dict
+from loguru import logger
+from app.core.llm import LLMService
+from app.core.provenance_chain import ProvenanceChain
+from app.engine.analyzers.base import BaseAnalyzer
+from app.engine.prompts.provenance_prompts import PROVENANCE_SYSTEM_PROMPT
+from sqlalchemy.ext.asyncio import async_sessionmaker
+class ProvenanceAnalyzer(BaseAnalyzer):
+    analysis_type = "provenance"
+    def __init__(self, llm_client: LLMService, db_session_factory: async_sessionmaker, provenance_chain: ProvenanceChain):
+        super().__init__(llm_client, db_session_factory)
+        self.provenance_chain = provenance_chain
+        self._system_prompt = PROVENANCE_SYSTEM_PROMPT
+    async def _rule_based_analyze(self, target_data: Dict) -> Dict:
+        intel_id = target_data.get("id", "")
+        try:
+            verification = await self.provenance_chain.verify_provenance(intel_id)
+            ver_dict = verification.to_dict() if hasattr(verification, "to_dict") else {"is_valid": False, "chain_length": 0, "completeness": 0.0}
+            try:
+                evolution = await self.provenance_chain.get_confidence_evolution(intel_id)
+                evo_data = evolution if isinstance(evolution, list) else []
+            except Exception:
+                evo_data = []
+            try:
+                hallucination = await self.provenance_chain.detect_hallucination(intel_id)
+                hall_data = hallucination if isinstance(hallucination, dict) else {"hallucination_detected": False}
+            except Exception:
+                hall_data = {"hallucination_detected": False}
+            is_valid = ver_dict.get("is_valid", False)
+            completeness = ver_dict.get("completeness", 0.0)
+            confidence = completeness * 0.7 + (0.3 if is_valid else 0.0)
+            summary = f"情报证实完成：链长{ver_dict.get('chain_length', 0)}，完整性{completeness:.2f}，{'有效' if is_valid else '存疑'}"
+            return {
+                "result_summary": summary,
+                "findings": [ver_dict],
+                "confidence_score": confidence,
+                "status": "completed",
+                "iocs": [],
+                "recommendations": ["补充源链记录"] if completeness < 0.5 else [],
+                "result_data": {"verification": ver_dict, "confidence_evolution": evo_data, "hallucination": hall_data},
+                "input_content": target_data.get("content", "")[:2000],
+            }
+        except Exception as exc:
+            logger.warning(f"Provenance rule analysis error: {exc}")
+            return {"result_summary": f"情报证实: {intel_id}", "findings": [], "confidence_score": 0.2, "status": "completed", "iocs": [], "recommendations": [], "result_data": {}, "input_content": target_data.get("content", "")[:2000]}
+    def _should_enhance_with_llm(self, rule_result: Dict) -> bool:
+        return rule_result.get("confidence_score", 0) < 0.5
+    def _build_prompt(self, target_data: Dict, rule_result: Dict) -> str:
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 46 */
+        content = target_data.get("content", "")[:2000]
+        return f"请评估以下威胁情报的可信度：\n\n情报内容：\n{content}\n\n已有源链验证结果：{rule_result.get('result_summary', '')}\n\n请判断此情报是否可信，是否存在幻觉或虚假信息。"
+    def _merge_results(self, rule_result: Dict, llm_result: Dict) -> Dict:
+        merged = rule_result.copy()
+        if isinstance(llm_result, dict):
+            reliability = llm_result.get("source_reliability", 0.5)
+            merged["confidence_score"] = (rule_result.get("confidence_score", 0.3) + reliability) / 2
+            merged["result_data"] = {**rule_result.get("result_data", {}), "llm_assessment": llm_result}
+            if llm_result.get("recommendations"):
+                merged["recommendations"] = list(set(rule_result.get("recommendations", []) + llm_result["recommendations"]))
+        return merged
+# ============================================================
+# File: engine/analyzers/decay.py
+# ============================================================
+from typing import Dict
+from loguru import logger
+from app.core.llm import LLMService
+from app.core.temporal_decay import TemporalDecay
+from app.engine.analyzers.base import BaseAnalyzer
+from app.engine.prompts.decay_prompts import DECAY_SYSTEM_PROMPT
+from sqlalchemy.ext.asyncio import async_sessionmaker
+class DecayAnalyzer(BaseAnalyzer):
+    analysis_type = "decay"
+    def __init__(self, llm_client: LLMService, db_session_factory: async_sessionmaker, temporal_decay: TemporalDecay):
+        super().__init__(llm_client, db_session_factory)
+        self.temporal_decay = temporal_decay
+        self._system_prompt = DECAY_SYSTEM_PROMPT
+    async def _rule_based_analyze(self, target_data: Dict) -> Dict:
+        intel_id = target_data.get("id", "")
+        try:
+            batch_result = await self.temporal_decay.batch_decay_analysis()
+            batch_dict = batch_result.to_dict() if hasattr(batch_result, "to_dict") else {"total_items": 0, "average_confidence": 0.0}
+            try:
+                curve = await self.temporal_decay.compute_decay_curve(intel_id)
+                curve_data = curve if isinstance(curve, list) else []
+            except Exception:
+                curve_data = []
+            try:
+                refresh_recs = await self.temporal_decay.recommend_refresh()
+                refresh_data = [r.to_dict() if hasattr(r, "to_dict") else str(r) for r in refresh_recs[:10]]
+            except Exception:
+                refresh_data = []
+            avg_conf = batch_dict.get("average_confidence", 0.0)
+            total = batch_dict.get("total_items", 0)
+            expired = batch_dict.get("expired_items", 0)
+            summary = f"衰减分析完成：{total}条情报，平均置信度{avg_conf:.2f}，{expired}条已过期"
+            return {
+                "result_summary": summary,
+                "findings": [{"id": intel_id, "decay_curve_points": len(curve_data)}],
+                "confidence_score": avg_conf,
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 47 */
+                "status": "completed",
+                "iocs": [],
+                "recommendations": [f"刷新{len(refresh_data)}条过期情报"] if refresh_data else [],
+                "result_data": {"batch_summary": batch_dict, "decay_curve": curve_data[:20], "refresh_recommendations": refresh_data},
+                "input_content": target_data.get("content", "")[:2000],
+            }
+        except Exception as exc:
+            logger.warning(f"Decay rule analysis error: {exc}")
+            return {"result_summary": f"衰减分析: {intel_id}", "findings": [], "confidence_score": 0.3, "status": "completed", "iocs": [], "recommendations": [], "result_data": {}, "input_content": target_data.get("content", "")[:2000]}
+    def _should_enhance_with_llm(self, rule_result: Dict) -> bool:
+        return rule_result.get("confidence_score", 0) < 0.3
+    def _build_prompt(self, target_data: Dict, rule_result: Dict) -> str:
+        content = target_data.get("content", "")[:2000]
+        conf = rule_result.get("confidence_score", 0)
+        return f"请评估以下已衰减的威胁情报是否仍有分析价值：\n\n情报内容：\n{content}\n\n当前衰减后置信度：{conf:.2f}\n\n请判断此情报是否仍具分析价值。"
+    def _merge_results(self, rule_result: Dict, llm_result: Dict) -> Dict:
+        merged = rule_result.copy()
+        if isinstance(llm_result, dict):
+            if llm_result.get("still_valuable", True):
+                merged["confidence_score"] = max(rule_result.get("confidence_score", 0.1), llm_result.get("remaining_relevance", 0.2))
+                merged["result_summary"] += " [LLM评估: 仍有价值]"
+            else:
+                merged["result_summary"] += " [LLM评估: 建议归档]"
+            merged["result_data"] = {**rule_result.get("result_data", {}), "llm_value_assessment": llm_result}
+            if llm_result.get("recommendations"):
+                merged["recommendations"] = list(set(rule_result.get("recommendations", []) + llm_result["recommendations"]))
+        return merged
+// ============================================================
+// File: pages/AttackPrediction.tsx
+// ============================================================
+import React, { useState, useEffect, useCallback } from 'react';
+import { Input, Button, Slider, Steps, Progress, Tag, Table, Spin, Empty, Tooltip, Collapse } from 'antd';
+import { AimOutlined, AlertOutlined, ExperimentOutlined, SearchOutlined } from '@ant-design/icons';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip as RTooltip, ResponsiveContainer, Line } from 'recharts';
+import { api, getErrorMessage } from '../services/api';
+import { useAntdMessage } from '../utils/hooks';
+const AttackPrediction: React.FC = () => {
+  const message = useAntdMessage();
+  const [entityInput, setEntityInput] = useState('');
+  const [depth, setDepth] = useState(5);
+  const [steps, setSteps] = useState(5);
+  const [predictResult, setPredictResult] = useState<Record<string, unknown> | null>(null);
+  const [simulateResult, setSimulateResult] = useState<Record<string, unknown> | null>(null);
+  const [warningResult, setWarningResult] = useState<Record<string, unknown> | null>(null);
+  const [vizData, setVizData] = useState<Record<string, unknown> | null>(null);
+  const [predictLoading, setPredictLoading] = useState(false);
+  const [simulateLoading, setSimulateLoading] = useState(false);
+  const [warningLoading, setWarningLoading] = useState(false);
+  const [vizLoading, setVizLoading] = useState(true);
+  const [history, setHistory] = useState<{ id?: string; action: string; input: string; time: string }[]>([]);
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 48 */
+  useEffect(() => {
+    (async () => {
+      try { const res = await api.attackPrediction.getVisualization(); setVizData(res); }
+      catch {} finally { setVizLoading(false); }
+    })();
+  }, []);
+  const addHistory = useCallback((action: string, input: string) => {
+    setHistory(prev => [{ action, input, time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }, ...prev].slice(0, 15));
+  }, []);
+  const handlePredict = async () => {
+    if (!entityInput.trim()) { message.warning('请输入实体ID或名称'); return; }
+    setPredictLoading(true); setPredictResult(null); setSimulateResult(null); setWarningResult(null);
+    try {
+      const isId = /^[a-f0-9-]{8,}$/i.test(entityInput.trim());
+      const res = isId ? await api.attackPrediction.predict(entityInput.trim(), depth) : await api.attackPrediction.predictByName(entityInput.trim(), depth);
+      setPredictResult(res as Record<string, unknown>);
+      addHistory('预测攻击链', entityInput.trim());
+    } catch (e) { message.error(getErrorMessage(e)); }
+    finally { setPredictLoading(false); }
+  };
+  const handleSimulate = async () => {
+    if (!entityInput.trim()) { message.warning('请输入实体ID'); return; }
+    setSimulateLoading(true); setPredictResult(null); setSimulateResult(null); setWarningResult(null);
+    try {
+      const res = await api.attackPrediction.simulate(entityInput.trim(), steps);
+      setSimulateResult(res as Record<string, unknown>);
+      addHistory('模拟推演', entityInput.trim());
+    } catch (e) { message.error(getErrorMessage(e)); }
+    finally { setSimulateLoading(false); }
+  };
+  const handleEarlyWarning = async () => {
+    if (!entityInput.trim()) { message.warning('请输入实体ID'); return; }
+    setWarningLoading(true); setPredictResult(null); setSimulateResult(null); setWarningResult(null);
+    try {
+      const res = await api.attackPrediction.earlyWarning(entityInput.trim());
+      setWarningResult(res as Record<string, unknown>);
+      addHistory('早期预警', entityInput.trim());
+    } catch (e) { message.error(getErrorMessage(e)); }
+    finally { setWarningLoading(false); }
+  };
+  const attackChain = (Array.isArray(predictResult?.attack_chain || predictResult?.steps || predictResult?.chain) ? (predictResult?.attack_chain || predictResult?.steps || predictResult?.chain) : []) as Record<string, unknown>[];
+  const probability = predictResult?.probability as number | undefined;
+  const warningLevel = warningResult?.warning_level as string | undefined;
+  const warningScore = warningResult?.risk_score as number | undefined;
+  const simulateSteps = (Array.isArray(simulateResult?.steps || simulateResult?.simulation_steps) ? (simulateResult?.steps || simulateResult?.simulation_steps) : []) as Record<string, unknown>[];
+  const chartData = (() => {
+    if (!vizData) return [];
+    const nodes = (vizData.nodes || vizData.entities || []) as Record<string, unknown>[];
+    if (nodes.length === 0) return [];
+    return nodes.slice(0, 20).map((n, i) => ({
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 49 */
+      name: (n.name || n.value || n.id || `Node${i}`) as string,
+      score: ((n.score || n.risk_score || n.confidence || 0) as number) * 100,
+      connections: ((n.degree || n.connections || n.relation_count || 0) as number),
+    }));
+  })();
+  const stepItems = attackChain.map((step, i) => ({
+    title: (step.stage || step.phase || step.type || `阶段 ${i + 1}`) as string,
+    description: (step.description || step.action || step.target || '') as string,
+    status: (i < attackChain.length - 1 ? 'finish' : 'process') as 'finish' | 'process',
+  }));
+  const simStepItems = simulateSteps.map((step, i) => ({
+    title: (step.stage || step.step || `Step ${i + 1}`) as string,
+    description: (step.description || step.action || step.entity || '') as string,
+    status: (i < simulateSteps.length - 1 ? 'finish' : 'process') as 'finish' | 'process',
+  }));
+  const historyColumns = [
+    { title: '操作', dataIndex: 'action', key: 'action', width: 120, render: (val: string) => {
+      const colorMap: Record<string, string> = { '预测攻击链': 'var(--primary)', '模拟推演': 'var(--green)', '早期预警': 'var(--red)' };
+      return <span style={{ display: 'inline-flex', padding: '2px 10px', borderRadius: 9999, background: 'var(--primary-dim)', color: colorMap[val] || 'var(--primary)', fontSize: 11, fontWeight: 500 }}>{val}</span>;
+    }},
+    { title: '输入', dataIndex: 'input', key: 'input', ellipsis: true, render: (val: string) => <span style={{ color: 'var(--text-1)' }}>{val}</span> },
+    { title: '时间', dataIndex: 'time', key: 'time', width: 100, render: (val: string) => <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-2)' }}>{val}</span> },
+  ];
+  return (
+    <div style={{ minHeight: '100%', overflowX: 'hidden' }}>
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 600, color: 'var(--text-0)', margin: 0, fontFamily: 'var(--font-body)' }}>攻击链预测</h1>
+        <p style={{ fontSize: 14, color: 'var(--text-2)', margin: '4px 0 0', fontFamily: 'var(--font-body)' }}>基于知识图谱预测可能的攻击路径和威胁演化</p>
+      </div>
+      <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20, marginBottom: 24 }}>
+        <div style={{ display: 'flex', gap: 16, alignItems: 'flex-end', marginBottom: 16, flexWrap: 'wrap' }}>
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>输入实体标识</label>
+            <Input placeholder="输入实体ID或名称，如IP、域名、组织名" value={entityInput} onChange={e => setEntityInput(e.target.value)} onPressEnter={handlePredict} />
+          </div>
+          <div style={{ minWidth: 200 }}>
+            <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>预测深度</label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Slider min={1} max={10} value={depth} onChange={setDepth} style={{ flex: 1, margin: 0 }} />
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--primary)', fontWeight: 500, minWidth: 20, textAlign: 'center' }}>{depth}</span>
+            </div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Tooltip title="基于实体预测可能的攻击链路径">
+            <Button type="primary" icon={<AimOutlined />} loading={predictLoading} onClick={handlePredict}>预测</Button>
+          </Tooltip>
+          <Tooltip title="模拟推演攻击演化过程">
+            <Button icon={<ExperimentOutlined />} loading={simulateLoading} onClick={handleSimulate} style={{ background: 'var(--green-dim)', border: '1px solid var(--green)', color: 'var(--green)', fontWeight: 500 }}>模拟</Button>
+          </Tooltip>
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 50 */
+          <Tooltip title="生成早期预警信息">
+            <Button icon={<AlertOutlined />} loading={warningLoading} onClick={handleEarlyWarning} style={{ background: 'var(--red-dim)', border: '1px solid var(--red)', color: 'var(--red)', fontWeight: 500 }}>预警</Button>
+          </Tooltip>
+        </div>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 24 }}>
+        <div className="chart-reveal chart-d-1" style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-0)', marginBottom: 16 }}>攻击链路径</div>
+          {predictLoading || simulateLoading || warningLoading ? (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div>
+          ) : predictResult ? (
+            <>
+              {stepItems.length > 0 ? (
+                <Steps direction="vertical" size="small" current={stepItems.length - 1} items={stepItems.map((step, i) => ({
+                  ...step,
+                  icon: <div style={{ width: 24, height: 24, borderRadius: '50%', background: 'var(--primary-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'var(--primary)', fontWeight: 600, border: '1px solid var(--primary-light)' }}>{i + 1}</div>,
+                }))} />
+              ) : <div style={{ color: 'var(--text-2)', fontSize: 13 }}>攻击链数据为空</div>}
+              {probability != null && (
+                <div style={{ marginTop: 16, padding: 16, background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+                  <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8 }}>预测概率</div>
+                  <Progress percent={Math.round(probability * 100)} strokeColor="var(--primary)" />
+                  <span style={{ display: 'inline-flex', padding: '2px 10px', borderRadius: 9999, background: 'var(--primary-dim)', color: 'var(--primary)', fontSize: 11, fontWeight: 500, marginTop: 8 }}>置信度 {(probability * 100).toFixed(1)}%</span>
+                </div>
+              )}
+            </>
+          ) : simulateResult ? (
+            simStepItems.length > 0 ? (
+              <Steps direction="vertical" size="small" current={simStepItems.length - 1} items={simStepItems.map((step, i) => ({
+                ...step,
+                icon: <div style={{ width: 24, height: 24, borderRadius: '50%', background: 'var(--green-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'var(--green)', fontWeight: 600, border: '1px solid var(--green)' }}>{i + 1}</div>,
+              }))} />
+            ) : <div style={{ color: 'var(--text-2)', fontSize: 13 }}>模拟数据为空</div>
+          ) : warningResult ? (
+            <div style={{ padding: 20, background: 'var(--red-dim)', borderRadius: 'var(--radius)', border: '1px solid var(--red)' }}>
+              <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--red)', marginBottom: 12 }}>预警等级：{warningLevel || '未知'}</div>
+              {warningScore != null && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 6 }}>风险评分</div>
+                  <Progress percent={Math.round(warningScore * 100)} strokeColor="var(--red)" />
+                </div>
+              )}
+              {Array.isArray(warningResult.warnings) && (warningResult.warnings as unknown[]).length > 0 && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8 }}>预警详情</div>
+                  {(warningResult.warnings as Record<string, unknown>[]).map((w, i) => (
+                    <span key={i} style={{ display: 'inline-flex', padding: '2px 10px', borderRadius: 9999, background: 'var(--red-dim)', color: 'var(--red)', fontSize: 11, fontWeight: 500, marginBottom: 4, marginRight: 4 }}>{String(w.type || w.description || w.message || JSON.stringify(w))}</span>
+                  ))}
+                </div>
+              )}
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 51 */
+            </div>
+          ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>执行预测以查看攻击链路径</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+        </div>
+        <div className="chart-reveal chart-d-2" style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-0)', marginBottom: 16 }}>风险可视化</div>
+          {vizLoading ? (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div>
+          ) : chartData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={280}>
+              <AreaChart data={chartData} margin={{ top: 5, right: 10, left: -10, bottom: 5 }}>
+                <defs>
+                  <linearGradient id="gradAccent" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="var(--primary-light)" stopOpacity={0.2} />
+                    <stop offset="95%" stopColor="var(--primary-light)" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                <XAxis dataKey="name" tick={{ fill: 'var(--text-2)', fontSize: 10 }} stroke="var(--border)" />
+                <YAxis tick={{ fill: 'var(--text-2)', fontSize: 10 }} stroke="var(--border)" />
+                <RTooltip contentStyle={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', color: 'var(--text-0)' }} />
+                <Area type="monotone" dataKey="score" stroke="var(--primary-light)" fill="url(#gradAccent)" strokeWidth={1.5} isAnimationActive={true} animationBegin={600} animationDuration={1200} animationEasing="ease-out" />
+                <Line type="monotone" dataKey="connections" stroke="var(--green)" strokeWidth={1} dot={false} isAnimationActive={true} animationBegin={600} animationDuration={1200} animationEasing="ease-out" />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>暂无可视化数据</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+        </div>
+      </div>
+      <Collapse
+        defaultActiveKey={['historyTable']}
+        items={[{
+          key: 'historyTable',
+          label: <span style={{ fontWeight: 600, color: 'var(--text-0)' }}>预测历史</span>,
+          children: (
+            <Table dataSource={history} columns={historyColumns} rowKey={(record) => `pred_${record.id || Math.random().toString(36).slice(2)}`} size="small" pagination={false} locale={{ emptyText: <span style={{ color: 'var(--text-2)' }}>暂无预测记录，执行预测操作后将在此显示</span> }} />
+          ),
+        }]}
+      />
+    </div>
+  );
+};
+export default AttackPrediction;
+// ============================================================
+// File: pages/Attribution.tsx
+// ============================================================
+import React, { useState, useEffect } from 'react';
+import { Input, Button, Table, Tag, Spin, Empty, Tabs, Slider, Progress, Space } from 'antd';
+import { SearchOutlined, RadarChartOutlined, TeamOutlined, FileTextOutlined } from '@ant-design/icons';
+import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip as RTooltip, ResponsiveContainer, ZAxis } from 'recharts';
+import { api, getErrorMessage } from '../services/api';
+import { useAntdMessage } from '../utils/hooks';
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 52 */
+const { TextArea } = Input;
+const Attribution: React.FC = () => {
+  const message = useAntdMessage();
+  const [intelId, setIntelId] = useState('');
+  const [fingerprintText, setFingerprintText] = useState('');
+  const [threshold, setThreshold] = useState(0.7);
+  const [entityId, setEntityId] = useState('');
+  const [fingerprintResult, setFingerprintResult] = useState<Record<string, unknown> | null>(null);
+  const [homologyResult, setHomologyResult] = useState<Record<string, unknown> | null>(null);
+  const [reportResult, setReportResult] = useState<Record<string, unknown> | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState('fingerprint');
+  const handleFingerprint = async () => {
+    if (!intelId.trim()) { message.warning('请输入情报ID'); return; }
+    setLoading(true); setFingerprintResult(null);
+    try { const res = await api.attribution.fingerprint(intelId.trim()); setFingerprintResult(res as Record<string, unknown>); }
+    catch (e) { message.error(getErrorMessage(e)); }
+    finally { setLoading(false); }
+  };
+  const handleHomology = async () => {
+    if (!entityId.trim()) { message.warning('请输入实体ID'); return; }
+    setLoading(true); setHomologyResult(null);
+    try { const res = await api.attribution.findSame(entityId.trim(), threshold); setHomologyResult(res as Record<string, unknown>); }
+    catch (e) { message.error(getErrorMessage(e)); }
+    finally { setLoading(false); }
+  };
+  const handleReport = async () => {
+    if (!intelId.trim()) { message.warning('请输入情报ID'); return; }
+    setLoading(true); setReportResult(null);
+    try { const res = await api.attribution.report(intelId.trim()); setReportResult(res as Record<string, unknown>); }
+    catch (e) { message.error(getErrorMessage(e)); }
+    finally { setLoading(false); }
+  };
+  const fingerprintFeatures = (() => {
+    if (!fingerprintResult) return [];
+    const raw = fingerprintResult.fingerprint || fingerprintResult.features || fingerprintResult.indicators || [];
+    return (Array.isArray(raw) ? raw : []) as Record<string, unknown>[];
+  })();
+  const homologousEntities = (() => {
+    if (!homologyResult) return [];
+    const raw = homologyResult.homologous_entities || homologyResult.entities || homologyResult.results || [];
+    return (Array.isArray(raw) ? raw : []) as Record<string, unknown>[];
+  })();
+  const scatterData = homologousEntities.map((e, i) => ({
+    x: (e.similarity || e.score || 0) as number,
+    y: (e.confidence || e.risk_score || Math.random() * 0.5 + 0.3) as number,
+    z: ((e.interactions || e.weight || 50 + Math.random() * 100) as number),
+    name: (e.name || e.entity_id || e.id || `Entity${i}`) as string,
+  }));
+  const fingerprintColumns = [
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 53 */
+    { title: '特征', dataIndex: 'name', key: 'name', render: (val: unknown, r: Record<string, unknown>) => <span style={{ color: 'var(--text-0)', fontWeight: 500 }}>{String(val || r.type || r.feature || '-')}</span> },
+    { title: '值', dataIndex: 'value', key: 'value', render: (val: unknown, r: Record<string, unknown>) => <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-1)' }}>{String(val || r.score || r.weight || '-')}</span> },
+    { title: '置信度', dataIndex: 'confidence', key: 'confidence', width: 140, render: (val: unknown, r: Record<string, unknown>) => { const score = (val || r.score || 0) as number; const color = score >= 0.7 ? 'var(--green)' : score >= 0.4 ? 'var(--yellow)' : 'var(--red)'; return <Progress percent={Math.round(score * 100)} size="small" strokeColor={color} />; } },
+    { title: '类型', dataIndex: 'type', key: 'type', width: 100, render: (val: unknown) => <span style={{ display: 'inline-flex', padding: '2px 10px', borderRadius: 9999, background: 'var(--purple-dim)', color: 'var(--purple)', fontSize: 11, fontWeight: 500 }}>{String(val || '通用')}</span> },
+  ];
+  const homologyColumns = [
+    { title: '实体', dataIndex: 'name', key: 'name', render: (val: unknown, r: Record<string, unknown>) => <span style={{ color: 'var(--text-0)', fontWeight: 500 }}>{String(val || r.entity_id || r.id || '-')}</span> },
+    { title: '相似度', dataIndex: 'similarity', key: 'similarity', width: 140, render: (val: unknown, r: Record<string, unknown>) => { const score = (val || r.score || 0) as number; const color = score >= 0.8 ? 'var(--red)' : score >= 0.5 ? 'var(--yellow)' : 'var(--green)'; return <Progress percent={Math.round(score * 100)} size="small" strokeColor={color} />; } },
+    { title: '置信度', dataIndex: 'confidence', key: 'confidence', width: 100, render: (val: unknown) => { const score = (val || 0) as number; return <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-0)', fontWeight: 500 }}>{(score * 100).toFixed(0)}%</span>; } },
+    { title: '关联特征', dataIndex: 'shared_features', key: 'shared_features', render: (val: unknown, r: Record<string, unknown>) => { const features = (val || r.features || []) as unknown[]; return features.length > 0 ? <Space size={2} wrap>{features.slice(0, 3).map((f, i) => <Tag key={i} style={{ fontSize: 10, margin: 0, borderRadius: 9999, background: 'var(--primary-dim)', color: 'var(--primary)', border: 'none' }}>{String(f)}</Tag>)}{features.length > 3 && <span style={{ fontSize: 10, color: 'var(--text-3)' }}>+{features.length - 3}</span>}</Space> : <span style={{ color: 'var(--text-3)' }}>-</span>; } },
+  ];
+  return (
+    <div style={{ minHeight: '100%', overflowX: 'hidden' }}>
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 600, color: 'var(--text-0)', margin: 0, fontFamily: 'var(--font-body)' }}>实体归因</h1>
+        <p style={{ fontSize: 14, color: 'var(--text-2)', margin: '4px 0 0', fontFamily: 'var(--font-body)' }}>识别威胁行为者，发现同源攻击实体</p>
+      </div>
+      <Tabs
+        activeKey={activeTab}
+        onChange={setActiveTab}
+        items={[
+          {
+            key: 'fingerprint',
+            label: '指纹分析',
+            children: (
+              <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+                <p style={{ fontSize: 13, color: 'var(--text-2)', margin: '0 0 16px' }}>提取情报的行为指纹特征，用于实体归因和同源分析</p>
+                <div style={{ display: 'flex', gap: 10, marginBottom: 20, alignItems: 'flex-end' }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>情报 ID</label>
+                    <Input placeholder="输入情报ID提取行为指纹" value={intelId} onChange={e => setIntelId(e.target.value)} onPressEnter={handleFingerprint} />
+                  </div>
+                  <Button type="primary" icon={<RadarChartOutlined />} loading={loading} onClick={handleFingerprint}>提取指纹</Button>
+                </div>
+                {loading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div> : fingerprintResult ? (
+                  <>
+                    {fingerprintResult.summary && (
+                      <div style={{ padding: 16, background: 'var(--purple-dim)', borderRadius: 'var(--radius)', border: '1px solid var(--purple)', marginBottom: 16 }}>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 6 }}>指纹摘要</div>
+                        <div style={{ fontSize: 13, color: 'var(--purple)', lineHeight: 1.6 }}>{String(fingerprintResult.summary)}</div>
+                      </div>
+                    )}
+                    {fingerprintFeatures.length > 0 ? (
+                      <Table dataSource={fingerprintFeatures.map((f, i) => ({ ...f, key: i }))} columns={fingerprintColumns} size="small" pagination={false} />
+                    ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>暂无指纹特征数据</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+                  </>
+                ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>输入情报ID提取行为指纹</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+              </div>
+            ),
+          },
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 54 */
+          {
+            key: 'homology',
+            label: '同源发现',
+            children: (
+              <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+                <p style={{ fontSize: 13, color: 'var(--text-2)', margin: '0 0 16px' }}>基于行为指纹发现同源攻击实体，调整相似度阈值筛选结果</p>
+                <div style={{ display: 'flex', gap: 16, marginBottom: 20, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                  <div style={{ flex: 1, minWidth: 200 }}>
+                    <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>实体 ID</label>
+                    <Input placeholder="输入实体ID查找同源实体" value={entityId} onChange={e => setEntityId(e.target.value)} onPressEnter={handleHomology} />
+                  </div>
+                  <div style={{ minWidth: 200 }}>
+                    <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>相似度阈值</label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <Slider min={0} max={1} step={0.05} value={threshold} onChange={setThreshold} style={{ flex: 1, margin: 0 }} />
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--primary)', fontWeight: 500, minWidth: 36, textAlign: 'center' }}>{threshold.toFixed(2)}</span>
+                    </div>
+                  </div>
+                  <Button type="primary" icon={<TeamOutlined />} loading={loading} onClick={handleHomology}>发现同源</Button>
+                </div>
+                {loading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div> : homologyResult ? (
+                  <>
+                    {scatterData.length > 0 && (
+                      <div className="chart-reveal chart-d-1" style={{ marginBottom: 20 }}>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 10 }}>同源实体分布</div>
+                        <ResponsiveContainer width="100%" height={280}>
+                          <ScatterChart margin={{ top: 10, right: 20, left: -10, bottom: 5 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                            <XAxis type="number" dataKey="x" name="相似度" tick={{ fill: 'var(--text-2)', fontSize: 11 }} stroke="var(--border)" domain={[0, 1]} label={{ value: '相似度', position: 'insideBottom', offset: -2, style: { fill: 'var(--text-3)', fontSize: 11 } }} />
+                            <YAxis type="number" dataKey="y" name="置信度" tick={{ fill: 'var(--text-2)', fontSize: 11 }} stroke="var(--border)" domain={[0, 1]} label={{ value: '置信度', angle: -90, position: 'insideLeft', style: { fill: 'var(--text-3)', fontSize: 11 } }} />
+                            <ZAxis type="number" dataKey="z" range={[60, 300]} />
+                            <RTooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', color: 'var(--text-0)' }} formatter={(val: number, name: string) => [val.toFixed(2), name]} />
+                            <Scatter data={scatterData} fill="var(--primary-light)" isAnimationActive={true} animationBegin={600} animationDuration={1200} animationEasing="ease-out" />
+                          </ScatterChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
+                    {homologousEntities.length > 0 ? (
+                      <Table dataSource={homologousEntities.map((e, i) => ({ ...e, key: i }))} columns={homologyColumns} size="small" pagination={{ pageSize: 10, size: 'small' }} />
+                    ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>未发现同源实体</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+                  </>
+                ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>输入实体ID发现同源攻击者</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+              </div>
+            ),
+          },
+          {
+            key: 'report',
+            label: '归因报告',
+            children: (
+              <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 55 */
+                <p style={{ fontSize: 13, color: 'var(--text-2)', margin: '0 0 16px' }}>生成情报的归因分析报告，包含行为者识别和同源分析结论</p>
+                <div style={{ display: 'flex', gap: 10, marginBottom: 20, alignItems: 'flex-end' }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>情报 ID</label>
+                    <Input placeholder="输入情报ID生成归因报告" value={intelId} onChange={e => setIntelId(e.target.value)} onPressEnter={handleReport} />
+                  </div>
+                  <Button type="primary" icon={<FileTextOutlined />} loading={loading} onClick={handleReport}>生成报告</Button>
+                </div>
+                {loading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div> : reportResult ? (
+                  <div style={{ padding: 20, background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+                    {reportResult.title ? <h3 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-0)', marginBottom: 16 }}>{String(reportResult.title)}</h3> : null}
+                    {reportResult.attribution ? (
+                      <div style={{ marginBottom: 16, padding: 16, background: 'var(--purple-dim)', borderRadius: 'var(--radius)', border: '1px solid var(--purple)' }}>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 6 }}>归因结论</div>
+                        <div style={{ fontSize: 14, color: 'var(--purple)', fontWeight: 500, lineHeight: 1.6 }}>{String(reportResult.attribution)}</div>
+                      </div>
+                    ) : null}
+                    {reportResult.confidence != null && (
+                      <div style={{ marginBottom: 16 }}>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8 }}>归因置信度</div>
+                        <Progress percent={Math.round((reportResult.confidence as number) * 100)} strokeColor={(reportResult.confidence as number) >= 0.7 ? 'var(--green)' : 'var(--yellow)'} />
+                      </div>
+                    )}
+                    {reportResult.summary ? (
+                      <div style={{ marginBottom: 16 }}>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8 }}>分析摘要</div>
+                        <div style={{ fontSize: 13, color: 'var(--text-1)', lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>{String(reportResult.summary)}</div>
+                      </div>
+                    ) : null}
+                    {Array.isArray(reportResult.evidence) && (reportResult.evidence as unknown[]).length > 0 && (
+                      <div>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8 }}>支撑证据</div>
+                        {(reportResult.evidence as Record<string, unknown>[]).map((e, i) => (
+                          <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 6 }}>
+                            <div style={{ width: 4, height: 4, borderRadius: '50%', background: 'var(--primary)', marginTop: 6, flexShrink: 0 }} />
+                            <span style={{ fontSize: 13, color: 'var(--text-1)', lineHeight: 1.6 }}>{String(e.description || e.type || JSON.stringify(e))}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>输入情报ID生成归因报告</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+              </div>
+            ),
+          },
+        ]}
+      />
+    </div>
+  );
+};
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 56 */
+export default Attribution;
+// ============================================================
+// File: pages/Provenance.tsx
+// ============================================================
+import React, { useState, useEffect } from 'react';
+import { Input, Button, Steps, Timeline, Table, Tag, Spin, Empty, Tabs, Progress, Descriptions } from 'antd';
+import { SafetyCertificateOutlined, AuditOutlined, WarningOutlined, SearchOutlined, LinkOutlined, FileSearchOutlined, CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons';
+import { api, getErrorMessage } from '../services/api';
+import { useAntdMessage } from '../utils/hooks';
+const STAGE_COLORS: Record<string, string> = {
+  raw_collection: 'var(--primary)', cleaned: 'var(--green)', analyzed: 'var(--blue)',
+  enriched: 'var(--yellow)', reported: 'var(--red)', pir_generated: 'var(--blue)',
+};
+const STAGE_ZH: Record<string, string> = {
+  raw_collection: '原始采集', cleaned: '已清洗', analyzed: '已分析',
+  enriched: '已增强', reported: '已报告', pir_generated: '已生成需求',
+};
+const Provenance: React.FC = () => {
+  const message = useAntdMessage();
+  const [intelId, setIntelId] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [verifyResult, setVerifyResult] = useState<Record<string, unknown> | null>(null);
+  const [chainResult, setChainResult] = useState<Record<string, unknown> | null>(null);
+  const [evolutionResult, setEvolutionResult] = useState<Record<string, unknown> | null>(null);
+  const [hallucinationResult, setHallucinationResult] = useState<Record<string, unknown> | null>(null);
+  const [searchResult, setSearchResult] = useState<Record<string, unknown> | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState('verify');
+  const handleVerify = async () => {
+    if (!intelId.trim()) { message.warning('请输入情报ID'); return; }
+    setLoading(true); setVerifyResult(null);
+    try { const res = await api.provenance.verify(intelId.trim()); setVerifyResult(res as Record<string, unknown>); }
+    catch (e) { message.error(getErrorMessage(e)); }
+    finally { setLoading(false); }
+  };
+  const handleChain = async () => {
+    if (!intelId.trim()) { message.warning('请输入情报ID'); return; }
+    setLoading(true); setChainResult(null);
+    try { const res = await api.provenance.chain(intelId.trim()); setChainResult(res as Record<string, unknown>); }
+    catch (e) { message.error(getErrorMessage(e)); }
+    finally { setLoading(false); }
+  };
+  const handleEvolution = async () => {
+    if (!intelId.trim()) { message.warning('请输入情报ID'); return; }
+    setLoading(true); setEvolutionResult(null);
+    try { const res = await api.provenance.evolution(intelId.trim()); setEvolutionResult(res as Record<string, unknown>); }
+    catch (e) { message.error(getErrorMessage(e)); }
+    finally { setLoading(false); }
+  };
+  const handleHallucination = async () => {
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 57 */
+    if (!intelId.trim()) { message.warning('请输入情报ID'); return; }
+    setLoading(true); setHallucinationResult(null);
+    try { const res = await api.provenance.hallucinationCheck(intelId.trim()); setHallucinationResult(res as Record<string, unknown>); }
+    catch (e) { message.error(getErrorMessage(e)); }
+    finally { setLoading(false); }
+  };
+  const handleSearch = async () => {
+    if (!searchQuery.trim()) { message.warning('请输入搜索内容'); return; }
+    setLoading(true); setSearchResult(null);
+    try { const res = await api.provenance.searchByContent(searchQuery.trim()); setSearchResult(res as Record<string, unknown>); }
+    catch (e) { message.error(getErrorMessage(e)); }
+    finally { setLoading(false); }
+  };
+  const chainSteps: { title: string; description: string; color: string }[] = (() => {
+    if (!chainResult) return [];
+    const steps = (chainResult.chain || chainResult.steps || chainResult.records || []) as Record<string, unknown>[];
+    return steps.map((item, i) => ({
+      title: (item.stage || item.type || item.action || `阶段 ${i + 1}`) as string,
+      description: (item.description || item.detail || item.source || '') as string,
+      color: STAGE_COLORS[(item.stage as string)] || 'var(--primary)',
+    }));
+  })();
+  const evolutionSteps = (() => {
+    if (!evolutionResult) return [];
+    const steps = (evolutionResult.evolution || evolutionResult.steps || evolutionResult.stages || []) as Record<string, unknown>[];
+    return steps.map((step, i) => ({
+      title: (step.stage || step.phase || `阶段 ${i + 1}`) as string,
+      description: (step.description || step.change || step.detail || '') as string,
+      color: STAGE_COLORS[(step.stage as string)] || 'var(--blue)',
+    }));
+  })();
+  const searchResults = (() => {
+    if (!searchResult) return [];
+    return (searchResult.results || searchResult.records || searchResult.items || []) as Record<string, unknown>[];
+  })();
+  const searchColumns = [
+    { title: '情报ID', dataIndex: 'intelligence_id', key: 'intelligence_id', width: 120, render: (val: unknown) => <a onClick={() => setIntelId(String(val))} style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--primary)' }}>{String(val).slice(0, 8)}…</a> },
+    { title: '阶段', dataIndex: 'stage', key: 'stage', width: 120, render: (val: unknown) => { const color = STAGE_COLORS[String(val)] || 'var(--text-2)'; return <span style={{ display: 'inline-flex', padding: '2px 10px', borderRadius: 9999, background: `${color}15`, color, fontSize: 11, fontWeight: 500 }}>{STAGE_ZH[String(val)] || String(val)}</span>; } },
+    { title: '内容摘要', dataIndex: 'content', key: 'content', ellipsis: true, render: (val: unknown) => <span style={{ color: 'var(--text-2)', fontSize: 12 }}>{String(val || '-').slice(0, 80)}</span> },
+  ];
+  return (
+    <div style={{ minHeight: '100%' }}>
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 600, color: 'var(--text-0)', margin: 0, fontFamily: 'var(--font-body)' }}>溯源链</h1>
+        <p style={{ fontSize: 14, color: 'var(--text-2)', margin: '4px 0 0', fontFamily: 'var(--font-body)' }}>验证情报来源可靠性，追踪信息传播路径</p>
+      </div>
+      <Tabs
+        activeKey={activeTab}
+        onChange={setActiveTab}
+        items={[
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 58 */
+          {
+            key: 'verify',
+            label: '验证',
+            children: (
+              <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+                <p style={{ fontSize: 13, color: 'var(--text-2)', margin: '0 0 16px' }}>输入情报ID验证其来源可靠性和数据完整性</p>
+                <div style={{ display: 'flex', gap: 10, marginBottom: 20, alignItems: 'flex-end' }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>情报 ID</label>
+                    <Input placeholder="输入情报ID进行验证" value={intelId} onChange={e => setIntelId(e.target.value)} onPressEnter={handleVerify} />
+                  </div>
+                  <Button type="primary" icon={<SearchOutlined />} loading={loading} onClick={handleVerify}>验证</Button>
+                </div>
+                {loading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div> : verifyResult ? (
+                  <div style={{ padding: 20, background: verifyResult.is_valid || verifyResult.verified ? 'var(--green-dim)' : 'var(--red-dim)', borderRadius: 'var(--radius)', border: `1px solid ${verifyResult.is_valid || verifyResult.verified ? 'var(--green)' : 'var(--red)'}` }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+                      {verifyResult.is_valid || verifyResult.verified ? <CheckCircleOutlined style={{ fontSize: 20, color: 'var(--green)' }} /> : <CloseCircleOutlined style={{ fontSize: 20, color: 'var(--red)' }} />}
+                      <span style={{ fontSize: 16, fontWeight: 600, color: verifyResult.is_valid || verifyResult.verified ? 'var(--green)' : 'var(--red)' }}>{verifyResult.is_valid || verifyResult.verified ? '验证通过' : '验证失败'}</span>
+                    </div>
+                    <Descriptions column={1} size="small" bordered>
+                      {Object.entries(verifyResult).filter(([k]) => !['is_valid', 'verified'].includes(k)).slice(0, 8).map(([key, val]) => (
+                        <Descriptions.Item key={key} label={<span style={{ color: 'var(--text-2)' }}>{key}</span>}><span style={{ color: 'var(--text-0)' }}>{typeof val === 'object' ? JSON.stringify(val) : String(val)}</span></Descriptions.Item>
+                      ))}
+                    </Descriptions>
+                  </div>
+                ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>输入情报ID进行溯源验证</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+              </div>
+            ),
+          },
+          {
+            key: 'chain',
+            label: '溯源链',
+            children: (
+              <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+                <p style={{ fontSize: 13, color: 'var(--text-2)', margin: '0 0 16px' }}>查看情报从采集到分析再到报告的完整溯源链路</p>
+                <div style={{ display: 'flex', gap: 10, marginBottom: 20, alignItems: 'flex-end' }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>情报 ID</label>
+                    <Input placeholder="输入情报ID查看完整溯源链" value={intelId} onChange={e => setIntelId(e.target.value)} onPressEnter={handleChain} />
+                  </div>
+                  <Button type="primary" icon={<LinkOutlined />} loading={loading} onClick={handleChain}>查看链路</Button>
+                </div>
+                {loading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div> : chainResult ? (
+                  chainSteps.length > 0 ? (
+                    <Timeline items={chainSteps.map((step, i) => ({
+                      color: step.color as 'blue' | 'green' | 'red' | 'gray' | undefined,
+                      children: (
+                        <div key={i} style={{ padding: '10px 14px', background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: step.color, marginBottom: 4 }}>{step.title}</div>
+                          <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.5 }}>{step.description}</div>
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 59 */
+                        </div>
+                      ),
+                    }))} />
+                  ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>暂无溯源链数据</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>输入情报ID查看溯源链</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+              </div>
+            ),
+          },
+          {
+            key: 'evolution',
+            label: '演化',
+            children: (
+              <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+                <p style={{ fontSize: 13, color: 'var(--text-2)', margin: '0 0 16px' }}>追踪情报在各处理阶段间的演化变化过程</p>
+                <div style={{ display: 'flex', gap: 10, marginBottom: 20, alignItems: 'flex-end' }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>情报 ID</label>
+                    <Input placeholder="输入情报ID追踪演化过程" value={intelId} onChange={e => setIntelId(e.target.value)} onPressEnter={handleEvolution} />
+                  </div>
+                  <Button type="primary" icon={<AuditOutlined />} loading={loading} onClick={handleEvolution}>追踪演化</Button>
+                </div>
+                {loading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div> : evolutionResult ? (
+                  evolutionSteps.length > 0 ? (
+                    <Steps direction="vertical" size="small" current={evolutionSteps.length - 1} items={evolutionSteps.map((step, i) => ({
+                      title: <span style={{ color: step.color, fontWeight: 500 }}>{step.title}</span>,
+                      description: <span style={{ color: 'var(--text-2)' }}>{step.description}</span>,
+                      icon: <div style={{ width: 24, height: 24, borderRadius: '50%', background: `${step.color}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: step.color, fontWeight: 600, border: `1px solid ${step.color}30` }}>{i + 1}</div>,
+                    }))} />
+                  ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>暂无演化数据</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>输入情报ID追踪演化</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+              </div>
+            ),
+          },
+          {
+            key: 'hallucination',
+            label: '幻觉检测',
+            children: (
+              <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+                <p style={{ fontSize: 13, color: 'var(--text-2)', margin: '0 0 16px' }}>检测AI生成内容中是否存在幻觉或虚假信息</p>
+                <div style={{ display: 'flex', gap: 10, marginBottom: 20, alignItems: 'flex-end' }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>情报 ID</label>
+                    <Input placeholder="输入情报ID检测AI幻觉" value={intelId} onChange={e => setIntelId(e.target.value)} onPressEnter={handleHallucination} />
+                  </div>
+                  <Button type="primary" icon={<WarningOutlined />} loading={loading} onClick={handleHallucination}>检测幻觉</Button>
+                </div>
+                {loading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div> : hallucinationResult ? (
+                  <div style={{ padding: 20, background: 'var(--red-dim)', borderRadius: 'var(--radius)', border: '1px solid var(--red)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+                      <WarningOutlined style={{ fontSize: 18, color: 'var(--red)' }} />
+/* 基于大模型的黑灰产威胁智能分析引擎 V1.0 */
+/* Page 60 */
+                      <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--red)' }}>幻觉检测结果</span>
+                    </div>
+                    {hallucinationResult.hallucination_score != null && (
+                      <div style={{ marginBottom: 16 }}>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8 }}>幻觉评分</div>
+                        <Progress percent={Math.round((hallucinationResult.hallucination_score as number) * 100)} strokeColor={(hallucinationResult.hallucination_score as number) > 0.5 ? 'var(--red)' : 'var(--green)'} />
+                      </div>
+                    )}
+                    {Array.isArray(hallucinationResult.hallucinations) && (hallucinationResult.hallucinations as unknown[]).length > 0 && (
+                      <div>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8 }}>检测到的幻觉内容</div>
+                        {(hallucinationResult.hallucinations as Record<string, unknown>[]).map((h, i) => (
+                          <div key={i} style={{ padding: '8px 12px', background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: '1px solid var(--border)', marginBottom: 6 }}>
+                            <span style={{ fontSize: 12, color: 'var(--red)' }}>{String(h.content || h.description || h.type || JSON.stringify(h))}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>输入情报ID检测AI幻觉</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+              </div>
+            ),
+          },
+          {
+            key: 'search',
+            label: '搜索',
+            children: (
+              <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+                <p style={{ fontSize: 13, color: 'var(--text-2)', margin: '0 0 16px' }}>按内容关键词搜索溯源记录</p>
+                <div style={{ display: 'flex', gap: 10, marginBottom: 20, alignItems: 'flex-end' }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>搜索内容</label>
+                    <Input placeholder="输入搜索内容..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} onPressEnter={handleSearch} />
+                  </div>
+                  <Button type="primary" icon={<SearchOutlined />} loading={loading} onClick={handleSearch}>搜索</Button>
+                </div>
+                {loading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div> : searchResult ? (
+                  searchResults.length > 0 ? (
+                    <Table dataSource={searchResults.map((r, i) => ({ ...r, key: i }))} columns={searchColumns} size="small" pagination={{ pageSize: 10, size: 'small' }} />
+                  ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>未找到匹配的溯源记录</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>输入关键词搜索溯源记录</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+              </div>
+            ),
+          },
+        ]}
+      />
+    </div>
+  );
+};
+export default Provenance;

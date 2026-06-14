@@ -1,0 +1,40 @@
+软件名称：黑灰产情报自动化采集与处理系统
+版本号：V1.0
+总代码行数（不含空行）：13627
+提交页数：60页
+每页行数：50行
+包含源文件：
+  - api/intelligence.py (753 行)
+  - api/intel_pipeline.py (796 行)
+  - api/alerts.py (539 行)
+  - api/blacktalk.py (226 行)
+  - api/reports.py (205 行)
+  - api/pirs.py (226 行)
+  - api/entities.py (167 行)
+  - core/auto_collector.py (1441 行)
+  - core/intel_pipeline.py (1090 行)
+  - core/alert_engine.py (553 行)
+  - core/blacktalk_engine.py (460 行)
+  - core/source_scheduler.py (440 行)
+  - core/stix_exporter.py (414 行)
+  - core/pir_engine.py (404 行)
+  - core/report_generator.py (136 行)
+  - core/rule_based_extractor.py (768 行)
+  - core/case_manager.py (317 行)
+  - core/ner_engine.py (564 行)
+  - pages/Intelligence.tsx (808 行)
+  - pages/AlertCenter.tsx (506 行)
+  - pages/Entities.tsx (1009 行)
+  - pages/PIRs.tsx (347 行)
+  - pages/IntelPipeline.tsx (1007 行)
+  - pages/Reports.tsx (379 行)
+
+格式说明：
+  - Word文档(.docx)格式
+  - 字体：Consolas 10号
+  - 行距：固定15磅
+  - 页边距：上下左右2.5cm
+  - 页眉：软件名称+版本号+页码
+  - 已删除含人名/地址/时间/版权的注释
+  - 每页50行有效代码（不含空行）
+  - 代码超过3000行，提交前30页+后30页

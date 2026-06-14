@@ -1,0 +1,239 @@
+{
+  "_comment": "Real security industry terminology used in threat intelligence, incident response, and vulnerability research. Compiled from public sources including MITRE ATT&CK, OWASP, NIST, and security vendor advisories.",
+  "categories": {
+    "vulnerability": {
+      "label_zh": "漏洞利用",
+      "label_en": "Vulnerability",
+      "keywords_zh": [
+        "漏洞",
+        "缺陷",
+        "0day",
+        "零日",
+        "零日漏洞",
+        "高危漏洞",
+        "CVE",
+        "补丁",
+        "安全更新",
+        "远程代码执行",
+        "权限提升",
+        "提权",
+        "缓冲区溢出",
+        "内存破坏",
+        "注入",
+        "认证绕过"
+      ],
+      "keywords_en": [
+        "vulnerability",
+        "exploit",
+        "CVE",
+        "patch",
+        "zero-day",
+        "0day",
+        "remote code execution",
+        "RCE",
+        "privilege escalation",
+        "buffer overflow",
+        "memory corruption",
+        "injection",
+        "authentication bypass",
+        "security update",
+        "out-of-bounds"
+      ],
+      "weight": 1.0
+    },
+    "malware": {
+      "label_zh": "恶意软件",
+      "label_en": "Malware",
+      "keywords_zh": [
+        "木马",
+        "病毒",
+        "勒索",
+        "挖矿",
+        "僵尸",
+        "远控",
+        "后门",
+        "间谍软件",
+        "恶意软件",
+        "蠕虫",
+        "Rootkit",
+        "键盘记录",
+        "勒索软件",
+        "僵尸网络"
+      ],
+      "keywords_en": [
+        "malware",
+        "ransomware",
+        "trojan",
+        "backdoor",
+        "botnet",
+        "spyware",
+        "rootkit",
+        "worm",
+        "keylogger",
+        "infostealer",
+        "stealer",
+        "loader",
+        "crypter",
+        "obfuscator"
+      ],
+      "weight": 1.0
+    },
+    "phishing": {
+      "label_zh": "钓鱼攻击",
+      "label_en": "Phishing",
+      "keywords_zh": [
+        "钓鱼",
+        "欺诈",
+        "仿冒",
+        "社工",
+        "短信诈骗",
+        "伪基站",
+        "邮件诈骗",
+        "假冒网站",
+        "商业邮件诈骗"
+      ],
+      "keywords_en": [
+        "phishing",
+        "scam",
+        "fraud",
+        "social engineering",
+        "BEC",
+        "business email compromise",
+        "spear-phishing",
+        "whaling",
+        "smishing",
+        "vishing",
+        "credential harvesting"
+      ],
+      "weight": 1.0
+    },
+    "data_leak": {
+      "label_zh": "数据泄露",
+      "label_en": "Data Breach",
+      "keywords_zh": [
+        "数据泄露",
+        "信息泄露",
+        "数据外泄",
+        "脱库",
+        "撞库",
+        "数据售卖",
+        "数据窃取",
+        "个人信息泄露"
+      ],
+      "keywords_en": [
+        "data breach",
+        "data leak",
+        "exposed",
+        "leaked credentials",
+        "dump",
+        "data exfiltration",
+        "stolen data",
+        "PII exposure",
+        "database dump"
+      ],
+      "weight": 1.0
+    },
+    "ddos": {
+      "label_zh": "拒绝服务攻击",
+      "label_en": "DDoS Attack",
+      "keywords_zh": [
+        "DDoS",
+        "拒绝服务",
+        "流量攻击",
+        "CC攻击",
+        "DDoS攻击",
+        "僵尸网络"
+      ],
+      "keywords_en": [
+        "DDoS",
+        "DoS",
+        "denial of service",
+        "amplification",
+        "reflection attack",
+        "volumetric attack",
+        "HTTP flood",
+        "slowloris"
+      ],
+      "weight": 1.0
+    },
+    "apt": {
+      "label_zh": "高级持续性威胁",
+      "label_en": "APT",
+      "keywords_zh": [
+        "APT",
+        "高级持续性威胁",
+        "国家级",
+        "APT组织",
+        "黑客组织",
+        "APT攻击",
+        "APT组织",
+        "网络间谍"
+      ],
+      "keywords_en": [
+        "APT",
+        "advanced persistent threat",
+        "nation-state",
+        "threat actor",
+        "espionage",
+        "cyber espionage",
+        "state-sponsored"
+      ],
+      "weight": 1.2
+    }
+  },
+  "severity_keywords": {
+    "critical": {
+      "label_zh": "严重",
+      "label_en": "Critical",
+      "zh": [
+        "严重",
+        "危急",
+        "灾难性",
+        "极高危",
+        "灾难级"
+      ],
+      "en": [
+        "critical",
+        "severe",
+        "catastrophic"
+      ]
+    },
+    "high": {
+      "label_zh": "高危",
+      "label_en": "High",
+      "zh": [
+        "高危",
+        "高风险",
+        "重要"
+      ],
+      "en": [
+        "high",
+        "important"
+      ]
+    },
+    "medium": {
+      "label_zh": "中危",
+      "label_en": "Medium",
+      "zh": [
+        "中危",
+        "中风险"
+      ],
+      "en": [
+        "medium",
+        "moderate"
+      ]
+    },
+    "low": {
+      "label_zh": "低危",
+      "label_en": "Low",
+      "zh": [
+        "低危",
+        "低风险"
+      ],
+      "en": [
+        "low",
+        "minor"
+      ]
+    }
+  }
+}

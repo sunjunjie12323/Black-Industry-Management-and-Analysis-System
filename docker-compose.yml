@@ -1,0 +1,39 @@
+version: "3.8"
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD:-Admin@2024}
+      - DATABASE_URL=sqlite+aiosqlite:///./threat_intel.db
+      - REDIS_URL=redis://redis:6379/0
+      - CORS_ORIGINS=["http://localhost:8000"]
+    volumes:
+      - app_data:/app/data
+      - app_db:/app/threat_intel.db
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  app_data:
+  app_db:

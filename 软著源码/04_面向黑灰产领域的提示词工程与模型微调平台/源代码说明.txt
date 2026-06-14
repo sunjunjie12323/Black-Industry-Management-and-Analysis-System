@@ -1,0 +1,29 @@
+软件名称：面向黑灰产领域的提示词工程与模型微调平台
+版本号：V1.0
+总代码行数（不含空行）：9553
+提交页数：60页
+每页行数：50行
+包含源文件：
+  - api/prompt_engine.py (932 行)
+  - api/data_pipeline.py (710 行)
+  - api/finetune.py (679 行)
+  - api/domain_finetune.py (238 行)
+  - core/prompt_engine_service.py (532 行)
+  - core/pipeline_engine.py (1934 行)
+  - core/finetune_engine.py (1389 行)
+  - core/domain_finetune.py (552 行)
+  - core/validators.py (426 行)
+  - core/llm.py (758 行)
+  - pages/PromptEngine.tsx (587 行)
+  - pages/DataPipeline.tsx (509 行)
+  - pages/ModelFinetune.tsx (268 行)
+
+格式说明：
+  - Word文档(.docx)格式
+  - 字体：Consolas 10号
+  - 行距：固定15磅
+  - 页边距：上下左右2.5cm
+  - 页眉：软件名称+版本号+页码
+  - 已删除含人名/地址/时间/版权的注释
+  - 每页50行有效代码（不含空行）
+  - 代码超过3000行，提交前30页+后30页

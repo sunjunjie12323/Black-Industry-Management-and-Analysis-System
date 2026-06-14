@@ -1,0 +1,322 @@
+[
+  {
+    "cveID": "CVE-2024-3094",
+    "vendorProject": "XZ Utils",
+    "product": "XZ Utils",
+    "vulnerabilityName": "XZ Utils Backdoor",
+    "dateAdded": "2024-03-29",
+    "shortDescription": "Malicious code introduced into XZ Utils 5.6.0 and 5.6.1 by a malicious maintainer allows SSH authentication bypass and remote code execution via liblzma.",
+    "requiredAction": "Apply mitigations per vendor instructions or downgrade to a safe version. Affected Linux distributions have issued security advisories.",
+    "dueDate": "2024-04-29"
+  },
+  {
+    "cveID": "CVE-2024-21412",
+    "vendorProject": "Microsoft",
+    "product": "Outlook",
+    "vulnerabilityName": "Microsoft Outlook Remote Code Execution Vulnerability",
+    "dateAdded": "2024-02-13",
+    "shortDescription": "Microsoft Outlook contains a remote code execution vulnerability where Moniker Link handling allows NTLM credential theft and bypass of Office Protected View.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-03-05"
+  },
+  {
+    "cveID": "CVE-2024-21413",
+    "vendorProject": "Microsoft",
+    "product": "Outlook",
+    "vulnerabilityName": "Microsoft Outlook Remote Code Execution Vulnerability",
+    "dateAdded": "2024-02-13",
+    "shortDescription": "Microsoft Outlook Spoofing vulnerability allows an attacker to bypass Office Protected View and leak NTLM hashes via crafted Outlook items.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-03-05"
+  },
+  {
+    "cveID": "CVE-2023-23397",
+    "vendorProject": "Microsoft",
+    "product": "Outlook",
+    "vulnerabilityName": "Microsoft Outlook Elevation of Privilege Vulnerability",
+    "dateAdded": "2023-03-14",
+    "shortDescription": "Microsoft Outlook contains an elevation of privilege vulnerability that allows NTLM credential theft when a specially crafted PidLidReminderFileParameter is processed.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2023-04-11"
+  },
+  {
+    "cveID": "CVE-2023-46805",
+    "vendorProject": "Ivanti",
+    "product": "Connect Secure",
+    "vulnerabilityName": "Ivanti Connect Secure Authentication Bypass",
+    "dateAdded": "2024-01-10",
+    "shortDescription": "Ivanti Connect Secure contains an authentication bypass vulnerability in the web component that allows an attacker to access restricted resources.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-01-31"
+  },
+  {
+    "cveID": "CVE-2024-1709",
+    "vendorProject": "ConnectWise",
+    "product": "ScreenConnect",
+    "vulnerabilityName": "ConnectWise ScreenConnect Authentication Bypass",
+    "dateAdded": "2024-02-19",
+    "shortDescription": "ConnectWise ScreenConnect 23.9.7 and prior contain an authentication bypass vulnerability that allows setup wizard re-enablement and admin account creation.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-03-11"
+  },
+  {
+    "cveID": "CVE-2024-27198",
+    "vendorProject": "JetBrains",
+    "product": "TeamCity",
+    "vulnerabilityName": "JetBrains TeamCity Authentication Bypass",
+    "dateAdded": "2024-03-04",
+    "shortDescription": "JetBrains TeamCity contains an authentication bypass vulnerability allowing unauthenticated access to administrative functionalities and full control of the server.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-03-25"
+  },
+  {
+    "cveID": "CVE-2024-23222",
+    "vendorProject": "Apple",
+    "product": "WebKit",
+    "vulnerabilityName": "Apple WebKit Type Confusion Vulnerability",
+    "dateAdded": "2024-01-23",
+    "shortDescription": "WebKit contains a type confusion vulnerability that allows arbitrary code execution when processing maliciously crafted web content.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-02-13"
+  },
+  {
+    "cveID": "CVE-2024-23204",
+    "vendorProject": "Apple",
+    "product": "Multiple Products",
+    "vulnerabilityName": "Apple iOS, iPadOS, macOS, Safari and visionOS Use-After-Free Vulnerability",
+    "dateAdded": "2024-01-23",
+    "shortDescription": "Apple operating systems contain a use-after-free vulnerability that allows arbitrary code execution when processing maliciously crafted web content.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-02-13"
+  },
+  {
+    "cveID": "CVE-2024-23897",
+    "vendorProject": "Jenkins",
+    "product": "Jenkins Core",
+    "vulnerabilityName": "Jenkins Arbitrary File Read Vulnerability",
+    "dateAdded": "2024-01-29",
+    "shortDescription": "Jenkins CLI contains an arbitrary file read vulnerability due to improper handling of @-file arguments that allows reading entire files from the controller filesystem.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-02-19"
+  },
+  {
+    "cveID": "CVE-2024-21887",
+    "vendorProject": "Ivanti",
+    "product": "Connect Secure and Policy Secure",
+    "vulnerabilityName": "Ivanti Connect Secure and Policy Secure Command Injection Vulnerability",
+    "dateAdded": "2024-01-10",
+    "shortDescription": "Ivanti Connect Secure and Policy Secure contain a command injection vulnerability in the web components that allows authenticated administrator to execute arbitrary commands.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-01-31"
+  },
+  {
+    "cveID": "CVE-2024-22024",
+    "vendorProject": "Ivanti",
+    "product": "Connect Secure, Policy Secure and ZTA Gateways",
+    "vulnerabilityName": "Ivanti Connect Secure, Policy Secure, and ZTA Gateways XXE Vulnerability",
+    "dateAdded": "2024-02-08",
+    "shortDescription": "An XXE vulnerability in Ivanti Connect Secure, Policy Secure and ZTA gateways allows an unauthenticated attacker to read certain sensitive resources.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-02-29"
+  },
+  {
+    "cveID": "CVE-2024-3400",
+    "vendorProject": "Palo Alto Networks",
+    "product": "PAN-OS",
+    "vulnerabilityName": "Palo Alto Networks PAN-OS GlobalProtect Command Injection Vulnerability",
+    "dateAdded": "2024-04-12",
+    "shortDescription": "A command injection vulnerability in the GlobalProtect feature of Palo Alto Networks PAN-OS software allows an unauthenticated attacker to execute arbitrary code with root privileges on the firewall.",
+    "requiredAction": "Apply updates per vendor instructions or enable Threat Prevention signatures.",
+    "dueDate": "2024-05-10"
+  },
+  {
+    "cveID": "CVE-2024-21762",
+    "vendorProject": "Fortinet",
+    "product": "FortiOS",
+    "vulnerabilityName": "Fortinet FortiOS Out-of-Bounds Write Vulnerability",
+    "dateAdded": "2024-02-08",
+    "shortDescription": "An out-of-bounds write vulnerability in FortiOS SSL VPN allows an unauthenticated remote attacker to execute arbitrary code or commands via specially crafted HTTP requests.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-02-29"
+  },
+  {
+    "cveID": "CVE-2024-0204",
+    "vendorProject": "Fortra",
+    "product": "GoAnywhere MFT",
+    "vulnerabilityName": "Fortra GoAnywhere MFT Authentication Bypass Vulnerability",
+    "dateAdded": "2024-01-23",
+    "shortDescription": "GoAnywhere MFT contains an authentication bypass vulnerability in the Administration portal that allows unauthorized administrative access.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-02-13"
+  },
+  {
+    "cveID": "CVE-2023-48788",
+    "vendorProject": "Fortinet",
+    "product": "FortiClient EMS",
+    "vulnerabilityName": "Fortinet FortiClientEMS SQL Injection Vulnerability",
+    "dateAdded": "2024-03-13",
+    "shortDescription": "FortiClientEMS contains an SQL injection vulnerability that allows an unauthenticated attacker to execute arbitrary SQL commands via the FGFM service.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-04-03"
+  },
+  {
+    "cveID": "CVE-2023-50164",
+    "vendorProject": "Apache",
+    "product": "Struts 2",
+    "vulnerabilityName": "Apache Struts 2 Path Traversal Vulnerability",
+    "dateAdded": "2023-12-07",
+    "shortDescription": "Apache Struts 2 contains a path traversal vulnerability that allows a remote attacker to upload a malicious file and achieve remote code execution.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2023-12-28"
+  },
+  {
+    "cveID": "CVE-2023-22518",
+    "vendorProject": "Atlassian",
+    "product": "Confluence Data Center and Server",
+    "vulnerabilityName": "Atlassian Confluence Data Center and Server Improper Authorization Vulnerability",
+    "dateAdded": "2023-10-16",
+    "shortDescription": "Atlassian Confluence Data Center and Server contain an improper authorization vulnerability that allows unauthenticated attackers to reset Confluence and create administrator accounts.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2023-11-06"
+  },
+  {
+    "cveID": "CVE-2023-20198",
+    "vendorProject": "Cisco",
+    "product": "IOS XE Web UI",
+    "vulnerabilityName": "Cisco IOS XE Web UI Remote Code Execution Vulnerability",
+    "dateAdded": "2023-10-16",
+    "shortDescription": "A vulnerability in the web UI feature of Cisco IOS XE software allows a remote, unauthenticated attacker to create a local user account with privilege level 15.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2023-11-06"
+  },
+  {
+    "cveID": "CVE-2023-20273",
+    "vendorProject": "Cisco",
+    "product": "IOS XE",
+    "vulnerabilityName": "Cisco IOS XE Web UI Command Injection Vulnerability",
+    "dateAdded": "2023-10-16",
+    "shortDescription": "A command injection vulnerability in the web UI feature of Cisco IOS XE software allows an authenticated remote attacker with privilege level 15 to execute arbitrary commands.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2023-11-06"
+  },
+  {
+    "cveID": "CVE-2023-5009",
+    "vendorProject": "Cisco",
+    "product": "AnyConnect VPN",
+    "vulnerabilityName": "Cisco AnyConnect VPN Server Buffer Overflow Vulnerability",
+    "dateAdded": "2024-01-10",
+    "shortDescription": "Multiple vulnerabilities in the SSL VPN feature of Cisco Small Business RV340, RV345, RV340W, and RV345W routers allow an unauthenticated remote attacker to execute arbitrary code.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-01-31"
+  },
+  {
+    "cveID": "CVE-2023-44487",
+    "vendorProject": "Multiple",
+    "product": "HTTP/2 Servers",
+    "vulnerabilityName": "HTTP/2 Rapid Reset Attack",
+    "dateAdded": "2023-10-10",
+    "shortDescription": "HTTP/2 protocol contains a denial-of-service vulnerability in the handling of RST_STREAM frames that allows attackers to launch high-volume distributed denial-of-service attacks.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2023-10-31"
+  },
+  {
+    "cveID": "CVE-2023-2868",
+    "vendorProject": "Barracuda",
+    "product": "Email Security Gateway (ESG)",
+    "vulnerabilityName": "Barracuda ESG Remote Command Injection Vulnerability",
+    "dateAdded": "2023-06-15",
+    "shortDescription": "Barracuda ESG contains a remote command injection vulnerability in the processing of TAR archive files that allows an unauthenticated attacker to execute commands on the ESG appliance.",
+    "requiredAction": "Apply updates per vendor instructions and replace impacted appliances per vendor instructions.",
+    "dueDate": "2023-07-06"
+  },
+  {
+    "cveID": "CVE-2024-6387",
+    "vendorProject": "OpenSSH",
+    "product": "sshd",
+    "vulnerabilityName": "OpenSSH Server regreSSHion Remote Code Execution",
+    "dateAdded": "2024-07-01",
+    "shortDescription": "OpenSSH server (sshd) contains a signal handler race condition that allows unauthenticated remote code execution as root on glibc-based Linux systems.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-07-22"
+  },
+  {
+    "cveID": "CVE-2024-49113",
+    "vendorProject": "Microsoft",
+    "product": "Windows LDAP",
+    "vulnerabilityName": "Microsoft Windows Lightweight Directory Access Protocol (LDAP) Denial of Service Vulnerability",
+    "dateAdded": "2024-12-10",
+    "shortDescription": "Windows LDAP contains a denial-of-service vulnerability that allows unauthenticated remote attackers to crash the LDAP service via crafted requests.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2025-01-07"
+  },
+  {
+    "cveID": "CVE-2024-43583",
+    "vendorProject": "Microsoft",
+    "product": "Windows Winlogon",
+    "vulnerabilityName": "Microsoft Windows Winlogon Elevation of Privilege Vulnerability",
+    "dateAdded": "2024-10-08",
+    "shortDescription": "Windows Winlogon contains an elevation of privilege vulnerability that allows an attacker to gain SYSTEM privileges on the affected host.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-11-05"
+  },
+  {
+    "cveID": "CVE-2024-30090",
+    "vendorProject": "Microsoft",
+    "product": "Windows Storage",
+    "vulnerabilityName": "Microsoft Windows Storage Spoofing Vulnerability",
+    "dateAdded": "2024-06-11",
+    "shortDescription": "Windows Storage contains a spoofing vulnerability that allows an unauthenticated attacker to perform man-in-the-middle attacks and potentially gain elevated privileges.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-07-02"
+  },
+  {
+    "cveID": "CVE-2024-7344",
+    "vendorProject": "Howyar",
+    "product": "Reloader",
+    "vulnerabilityName": "Howyar Reloader Secure Boot Bypass",
+    "dateAdded": "2025-01-14",
+    "shortDescription": "Howyar Reloader contains a vulnerability that allows an attacker with physical access to bypass Secure Boot and execute unsigned code on affected devices.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2025-02-04"
+  },
+  {
+    "cveID": "CVE-2024-21893",
+    "vendorProject": "Ivanti",
+    "product": "Connect Secure",
+    "vulnerabilityName": "Ivanti Connect Secure Server-Side Request Forgery Vulnerability",
+    "dateAdded": "2024-01-31",
+    "shortDescription": "A server-side request forgery vulnerability in Ivanti Connect Secure allows an unauthenticated attacker to access restricted resources without authentication.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-02-21"
+  },
+  {
+    "cveID": "CVE-2024-3661",
+    "vendorProject": "Multiple",
+    "product": "VPN Clients",
+    "vulnerabilityName": "TunnelVision VPN Traffic Interception Vulnerability",
+    "dateAdded": "2024-05-09",
+    "shortDescription": "Various VPN clients are vulnerable to a local network attack that uses DHCP option 121 to manipulate routing tables and divert VPN traffic outside the VPN tunnel.",
+    "requiredAction": "Apply updates per vendor instructions or implement mitigations per vendor advisory.",
+    "dueDate": "2024-05-30"
+  },
+  {
+    "cveID": "CVE-2024-39717",
+    "vendorProject": "Versa Networks",
+    "product": "Versa Director",
+    "vulnerabilityName": "Versa Networks Versa Director Path Traversal Vulnerability",
+    "dateAdded": "2024-08-22",
+    "shortDescription": "Versa Director contains a path traversal vulnerability in the portal function that allows an authenticated attacker to upload arbitrary files to the server.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-09-12"
+  },
+  {
+    "cveID": "CVE-2024-7591",
+    "vendorProject": "Ivanti",
+    "product": "vTM",
+    "vulnerabilityName": "Ivanti vTM Authentication Bypass",
+    "dateAdded": "2024-08-14",
+    "shortDescription": "Ivanti vTM contains an authentication bypass vulnerability that allows a remote unauthenticated attacker to bypass admin authentication and create new admin sessions.",
+    "requiredAction": "Apply updates per vendor instructions.",
+    "dueDate": "2024-09-04"
+  }
+]

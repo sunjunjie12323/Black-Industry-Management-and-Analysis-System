@@ -1,0 +1,29 @@
+软件名称：黑灰产情报智能问答与内容生成系统
+版本号：V1.0
+总代码行数（不含空行）：9776
+提交页数：60页
+每页行数：50行
+包含源文件：
+  - api/smartqa.py (853 行)
+  - api/translation.py (645 行)
+  - api/content_gen.py (829 行)
+  - api/industry_scene.py (527 行)
+  - core/qa_engine.py (1655 行)
+  - core/translation_engine.py (1145 行)
+  - core/content_engine.py (1260 行)
+  - core/vector_store.py (319 行)
+  - core/local_embedding.py (233 行)
+  - core/llm.py (758 行)
+  - pages/SmartQA.tsx (468 行)
+  - pages/ContentGeneration.tsx (335 行)
+  - pages/IndustryScene.tsx (710 行)
+
+格式说明：
+  - Word文档(.docx)格式
+  - 字体：Consolas 10号
+  - 行距：固定15磅
+  - 页边距：上下左右2.5cm
+  - 页眉：软件名称+版本号+页码
+  - 已删除含人名/地址/时间/版权的注释
+  - 每页50行有效代码（不含空行）
+  - 代码超过3000行，提交前30页+后30页

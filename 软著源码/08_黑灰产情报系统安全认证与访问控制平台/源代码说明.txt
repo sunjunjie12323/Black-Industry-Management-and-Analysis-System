@@ -1,0 +1,30 @@
+软件名称：黑灰产情报系统安全认证与访问控制平台
+版本号：V1.0
+总代码行数（不含空行）：6002
+提交页数：60页
+每页行数：50行
+包含源文件：
+  - api/auth.py (308 行)
+  - api/deployment.py (1609 行)
+  - core/auth.py (1390 行)
+  - core/rate_limiter.py (654 行)
+  - core/api_key_manager.py (243 行)
+  - core/api_key_auth.py (28 行)
+  - core/tenant.py (249 行)
+  - core/tenant_manager.py (103 行)
+  - core/tenant_middleware.py (72 行)
+  - core/cache_service.py (181 行)
+  - core/metrics.py (62 行)
+  - core/metrics_middleware.py (18 行)
+  - pages/Login.tsx (784 行)
+  - pages/DeploymentManage.tsx (259 行)
+
+格式说明：
+  - Word文档(.docx)格式
+  - 字体：Consolas 10号
+  - 行距：固定15磅
+  - 页边距：上下左右2.5cm
+  - 页眉：软件名称+版本号+页码
+  - 已删除含人名/地址/时间/版权的注释
+  - 每页50行有效代码（不含空行）
+  - 代码超过3000行，提交前30页+后30页

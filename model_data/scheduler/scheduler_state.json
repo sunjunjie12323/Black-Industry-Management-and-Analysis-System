@@ -1,0 +1,157 @@
+{
+  "sources": {
+    "threatbook_feed": {
+      "source_id": "threatbook_feed",
+      "name": "微步在线威胁情报",
+      "source_type": "commercial",
+      "priority": "critical",
+      "status": "active",
+      "interval_minutes": 15,
+      "max_results_per_cycle": 100,
+      "keywords": [
+        "黑产",
+        "木马",
+        "钓鱼",
+        "APT",
+        "勒索",
+        "0day"
+      ],
+      "config": {
+        "api_type": "threatbook"
+      },
+      "last_collected_at": "2026-06-13T10:46:28.784064+00:00",
+      "last_error": "",
+      "total_collected": 0,
+      "total_errors": 0,
+      "consecutive_errors": 0,
+      "rate_limit_until": null
+    },
+    "alienvault_otx": {
+      "source_id": "alienvault_otx",
+      "name": "AlienVault OTX",
+      "source_type": "forum",
+      "priority": "high",
+      "status": "active",
+      "interval_minutes": 30,
+      "max_results_per_cycle": 50,
+      "keywords": [
+        "malware",
+        "phishing",
+        "ransomware",
+        "APT",
+        "exploit"
+      ],
+      "config": {
+        "api_type": "otx"
+      },
+      "last_collected_at": "2026-06-13T10:46:30.510681+00:00",
+      "last_error": "",
+      "total_collected": 200,
+      "total_errors": 0,
+      "consecutive_errors": 0,
+      "rate_limit_until": null
+    },
+    "cisa_kev": {
+      "source_id": "cisa_kev",
+      "name": "CISA已知被利用漏洞",
+      "source_type": "forum",
+      "priority": "high",
+      "status": "active",
+      "interval_minutes": 60,
+      "max_results_per_cycle": 50,
+      "keywords": [],
+      "config": {
+        "api_type": "cisa_kev"
+      },
+      "last_collected_at": "2026-06-13T10:46:32.194287+00:00",
+      "last_error": "",
+      "total_collected": 150,
+      "total_errors": 0,
+      "consecutive_errors": 0,
+      "rate_limit_until": null
+    },
+    "sogou_wechat": {
+      "source_id": "sogou_wechat",
+      "name": "搜狗微信公众号",
+      "source_type": "wechat",
+      "priority": "medium",
+      "status": "active",
+      "interval_minutes": 30,
+      "max_results_per_cycle": 30,
+      "keywords": [
+        "黑灰产",
+        "反诈",
+        "网络犯罪",
+        "洗钱",
+        "诈骗"
+      ],
+      "config": {
+        "api_type": "sogou"
+      },
+      "last_collected_at": "2026-06-13T10:46:43.546220+00:00",
+      "last_error": "",
+      "total_collected": 0,
+      "total_errors": 0,
+      "consecutive_errors": 0,
+      "rate_limit_until": null
+    },
+    "abuseipdb": {
+      "source_id": "abuseipdb",
+      "name": "AbuseIPDB",
+      "source_type": "commercial",
+      "priority": "medium",
+      "status": "active",
+      "interval_minutes": 60,
+      "max_results_per_cycle": 50,
+      "keywords": [],
+      "config": {
+        "api_type": "abuseipdb"
+      },
+      "last_collected_at": "2026-06-13T10:46:43.552944+00:00",
+      "last_error": "",
+      "total_collected": 0,
+      "total_errors": 0,
+      "consecutive_errors": 0,
+      "rate_limit_until": null
+    },
+    "circl_cve": {
+      "source_id": "circl_cve",
+      "name": "CIRCL CVE",
+      "source_type": "forum",
+      "priority": "low",
+      "status": "active",
+      "interval_minutes": 120,
+      "max_results_per_cycle": 30,
+      "keywords": [],
+      "config": {
+        "api_type": "circl"
+      },
+      "last_collected_at": "2026-06-13T09:44:30.309140+00:00",
+      "last_error": "",
+      "total_collected": 60,
+      "total_errors": 0,
+      "consecutive_errors": 0,
+      "rate_limit_until": null
+    },
+    "manual_import": {
+      "source_id": "manual_import",
+      "name": "手动导入",
+      "source_type": "manual",
+      "priority": "critical",
+      "status": "active",
+      "interval_minutes": 0,
+      "max_results_per_cycle": 0,
+      "keywords": [],
+      "config": {},
+      "last_collected_at": null,
+      "last_error": "",
+      "total_collected": 0,
+      "total_errors": 0,
+      "consecutive_errors": 0,
+      "rate_limit_until": null
+    }
+  },
+  "total_cycles": 14,
+  "total_items_collected": 410,
+  "saved_at": "2026-06-13T10:46:43.582761+00:00"
+}

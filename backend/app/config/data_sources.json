@@ -1,0 +1,63 @@
+{
+  "rss_feeds": [
+    {
+      "name": "FreeBuf",
+      "url": "https://www.freebuf.com/feed",
+      "type": "rss",
+      "source_tag": "web",
+      "language": "zh",
+      "poll_interval_minutes": 60
+    },
+    {
+      "name": "先知社区",
+      "url": "https://xz.aliyun.com/feed",
+      "type": "atom",
+      "source_tag": "web",
+      "language": "zh",
+      "poll_interval_minutes": 60
+    },
+    {
+      "name": "绿盟科技博客",
+      "url": "https://blog.nsfocus.net/feed/",
+      "type": "rss",
+      "source_tag": "web",
+      "language": "zh",
+      "poll_interval_minutes": 120
+    },
+    {
+      "name": "360 Netlab博客",
+      "url": "https://blog.netlab.360.com/feed/",
+      "type": "rss",
+      "source_tag": "web",
+      "language": "zh",
+      "poll_interval_minutes": 120
+    },
+    {
+      "name": "Seebug Paper",
+      "url": "https://paper.seebug.org/rss/",
+      "type": "rss",
+      "source_tag": "web",
+      "language": "zh",
+      "poll_interval_minutes": 240
+    }
+  ],
+  "api_sources": [
+    {
+      "name": "ThreatBook",
+      "url": "https://api.threatbook.cn/v3/scene/ip_reputation",
+      "type": "json_api",
+      "source_tag": "web",
+      "parser": "threatbook",
+      "api_key_env": "THREATBOOK_API_KEY",
+      "poll_interval_minutes": 60,
+      "enabled": false
+    }
+  ],
+  "seed_datasets": [
+    {
+      "name": "CISA_KEV",
+      "file": "app/data/seed_cisa_kev.json",
+      "source_tag": "web"
+    }
+  ]
+}

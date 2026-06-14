@@ -1,0 +1,3123 @@
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 1 */
+# ============================================================
+# File: api/auth.py
+# ============================================================
+import re
+from datetime import datetime, timezone
+from typing import List, Optional
+from fastapi import APIRouter, Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from loguru import logger
+from pydantic import BaseModel, Field
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.auth import (
+    Permission,
+    Role,
+    User,
+    UserOut,
+    blacklist_token,
+    create_access_token,
+    create_refresh_token,
+    create_user,
+    get_all_users,
+    get_current_user,
+    get_user_by_id,
+    get_user_by_username,
+    has_permission,
+    hash_password,
+    record_login_success,
+    require_permission,
+    require_role,
+    revoke_all_refresh_tokens,
+    revoke_refresh_token,
+    update_user_password,
+    verify_password,
+    verify_refresh_token,
+)
+from app.core.exceptions import ForbiddenException, UnauthorizedException, ValidationException
+from app.db.database import get_db
+from app.db.tables import UserTable
+router = APIRouter(prefix="/auth", tags=["auth"])
+_MAX_LOGIN_ATTEMPTS = 5
+_LOCKOUT_SECONDS = 300
+_IP_RATE_LIMIT = 20
+_IP_RATE_WINDOW = 300
+_ip_login_attempts: dict[str, list[float]] = {}
+def _check_ip_rate_limit(ip: str):
+    import time as _time
+    now = _time.monotonic()
+    attempts = _ip_login_attempts.get(ip, [])
+    attempts = [t for t in attempts if now - t < _IP_RATE_WINDOW]
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 2 */
+    _ip_login_attempts[ip] = attempts
+    if len(attempts) >= _IP_RATE_LIMIT:
+        from app.core.exceptions import ForbiddenException
+        raise ForbiddenException(detail="登录尝试过于频繁，请5分钟后重试")
+    attempts.append(now)
+async def _check_login_lockout(username: str):
+    user = await get_user_by_username(username)
+    if user is None:
+        return
+    if user.locked_until and datetime.now(timezone.utc) < user.locked_until.replace(tzinfo=timezone.utc):
+        remaining = int((user.locked_until.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+        raise ForbiddenException(detail=f"账号已锁定，请{remaining}秒后重试")
+async def _record_failed_login(username: str, db_session=None):
+    user = await get_user_by_username(username)
+    if user is None:
+        return
+    new_count = user.login_fail_count + 1
+    values = {"login_fail_count": new_count}
+    if new_count >= _MAX_LOGIN_ATTEMPTS:
+        from datetime import timedelta
+        values["locked_until"] = datetime.now(timezone.utc) + timedelta(seconds=_LOCKOUT_SECONDS)
+        logger.warning(f"Account locked due to brute force: {username}")
+    if db_session is not None:
+        await db_session.execute(
+            update(UserTable).where(UserTable.username == username).values(**values)
+        )
+        await db_session.commit()
+    else:
+        from app.db.database import async_session_factory
+        async with async_session_factory() as session:
+            await session.execute(
+                update(UserTable).where(UserTable.username == username).values(**values)
+            )
+            await session.commit()
+async def _clear_failed_logins(username: str, db_session=None):
+    if db_session is not None:
+        await db_session.execute(
+            update(UserTable).where(UserTable.username == username).values(
+                login_fail_count=0, locked_until=None
+            )
+        )
+        await db_session.commit()
+    else:
+        from app.db.database import async_session_factory
+        async with async_session_factory() as session:
+            await session.execute(
+                update(UserTable).where(UserTable.username == username).values(
+                    login_fail_count=0, locked_until=None
+                )
+            )
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 3 */
+            await session.commit()
+def _validate_password_strength(password: str):
+    from app.core.auth import validate_password_strength
+    is_strong, msg = validate_password_strength(password)
+    if not is_strong:
+        raise ValidationException(detail=msg)
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=128)
+class LoginResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int = 86400
+    user: UserOut
+    must_change_password: bool = False
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=1, max_length=512)
+class RefreshResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int = 86400
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=128)
+    password: str = Field(..., min_length=8, max_length=128)
+    role: Role = Role.VIEWER
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=8, max_length=128)
+    new_password: str = Field(..., min_length=8, max_length=128)
+@router.post("/login", response_model=LoginResponse)
+async def login(data: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    client_ip = request.client.host if request.client else "unknown"
+    _check_ip_rate_limit(client_ip)
+    await _check_login_lockout(data.username)
+    user = await get_user_by_username(data.username)
+    if user is None:
+        hash_password(data.username)
+        raise UnauthorizedException(detail="用户名或密码错误")
+    if not user.is_active:
+        raise UnauthorizedException(detail="用户账号已被停用")
+    if not verify_password(data.password, user.hashed_password):
+        await _record_failed_login(data.username, db_session=db)
+        raise UnauthorizedException(detail="用户名或密码错误")
+    await _clear_failed_logins(data.username, db_session=db)
+    access_token = create_access_token(user)
+    refresh_token = await create_refresh_token(user)
+    await record_login_success(user.id)
+    logger.info(f"User logged in: {data.username}")
+    must_change = False
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 4 */
+    if user.hashed_password and hasattr(user, 'must_change_password') and user.must_change_password:
+        must_change = True
+    elif user.hashed_password and verify_password("admin", user.hashed_password):
+        must_change = True
+    return LoginResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        user=UserOut(
+            id=user.id,
+            username=user.username,
+            role=user.role,
+            is_active=user.is_active,
+            totp_enabled=user.totp_enabled,
+            last_login_at=user.last_login_at,
+            created_at=user.created_at,
+        ),
+        must_change_password=must_change,
+    )
+@router.post("/register", response_model=UserOut, status_code=201)
+async def register(
+    data: RegisterRequest,
+    current_user: User = Depends(require_role(Role.ADMIN)),
+):
+    _validate_password_strength(data.password)
+    existing = await get_user_by_username(data.username)
+    if existing is not None:
+        raise ValidationException(detail=f"用户名 '{data.username}' 已存在")
+    try:
+        user = await create_user(
+            username=data.username,
+            password=data.password,
+            role=Role.VIEWER,
+        )
+    except ValueError as exc:
+        raise ValidationException(detail="验证失败")
+    except Exception as exc:
+        logger.error(f"Failed to create user: {exc}")
+        raise ValidationException(detail="创建用户失败，请稍后重试")
+    return UserOut(
+        id=user.id,
+        username=user.username,
+        role=user.role,
+        is_active=user.is_active,
+        totp_enabled=user.totp_enabled,
+        last_login_at=user.last_login_at,
+        created_at=user.created_at,
+    )
+@router.get("/me", response_model=UserOut)
+async def get_me(current_user: User = Depends(get_current_user)):
+    return UserOut(
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 5 */
+        id=current_user.id,
+        username=current_user.username,
+        role=current_user.role,
+        is_active=current_user.is_active,
+        totp_enabled=current_user.totp_enabled,
+        last_login_at=current_user.last_login_at,
+        created_at=current_user.created_at,
+    )
+@router.put("/password")
+async def change_password(
+    data: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+):
+    if not verify_password(data.current_password, current_user.hashed_password):
+        raise ValidationException(detail="当前密码不正确")
+    if data.current_password == data.new_password:
+        raise ValidationException(detail="新密码不能与当前密码相同")
+    _validate_password_strength(data.new_password)
+    try:
+        await update_user_password(current_user.username, data.new_password)
+    except Exception as e:
+        logger.error(f"Failed to update password for user {current_user.username}: {e}")
+        raise ValidationException(detail="密码修改失败，请稍后重试")
+    return {"message": "密码修改成功"}
+@router.put("/profile")
+async def update_profile(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    body = await request.json()
+    display_name = body.get("display_name")
+    email = body.get("email")
+    async with get_db() as db:
+        updates = {}
+        if display_name is not None:
+            updates["display_name"] = display_name
+        if email is not None:
+            updates["email"] = email
+        if updates:
+            stmt = update(UserTable).where(UserTable.id == current_user.id).values(**updates)
+            await db.execute(stmt)
+            await db.commit()
+    return {"message": "资料更新成功"}
+@router.post("/logout")
+async def logout(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer()),
+):
+    token = credentials.credentials
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 6 */
+    await blacklist_token(token)
+    logger.info(f"User logged out: {current_user.username}")
+    return {"message": "退出登录成功"}
+@router.post("/refresh", response_model=RefreshResponse)
+async def refresh_token(data: RefreshRequest):
+    user = await verify_refresh_token(data.refresh_token)
+    if user is None:
+        raise UnauthorizedException(detail="刷新令牌无效或已过期")
+    if not user.is_active:
+        raise UnauthorizedException(detail="用户账号已被停用")
+    await revoke_refresh_token(data.refresh_token)
+    new_access_token = create_access_token(user)
+    new_refresh_token = await create_refresh_token(user)
+    return RefreshResponse(
+        access_token=new_access_token,
+        refresh_token=new_refresh_token,
+    )
+@router.get("/permissions")
+async def get_permissions(current_user: User = Depends(get_current_user)):
+    from app.core.auth import ROLE_PERMISSIONS, Permission
+    user_perms = ROLE_PERMISSIONS.get(current_user.role, set())
+    return {
+        "role": current_user.role.value,
+        "permissions": [p.value for p in user_perms],
+    }
+@router.post("/revoke-all-sessions")
+async def revoke_all_sessions(current_user: User = Depends(get_current_user)):
+    count = await revoke_all_refresh_tokens(current_user.id)
+    return {"message": f"已撤销{count}个会话", "revoked_count": count}
+@router.get("/users", response_model=List[UserOut])
+async def list_users(current_user: User = Depends(require_role(Role.ADMIN))):
+    users = await get_all_users()
+    return [
+        UserOut(
+            id=u.id,
+            username=u.username,
+            role=u.role,
+            is_active=u.is_active,
+            totp_enabled=u.totp_enabled,
+            last_login_at=u.last_login_at,
+            created_at=u.created_at,
+        )
+        for u in users
+    ]
+@router.get("/csrf-token")
+async def get_csrf_token(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    secret = getattr(request.app.state, 'csrf_secret', None)
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 7 */
+    if not secret:
+        from pathlib import Path
+        csrf_path = Path(__file__).resolve().parent.parent.parent / ".csrf_secret"
+        if csrf_path.exists():
+            secret = csrf_path.read_text().strip()
+        else:
+            import secrets as sec
+            secret = sec.token_urlsafe(32)
+    import hmac
+    token = hmac.new(secret.encode(), b"csrf", "sha256").hexdigest()
+    return {"csrf_token": token}
+# ============================================================
+# File: api/deployment.py
+# ============================================================
+import asyncio
+import json
+import os
+import platform
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.auth import User, get_current_user, require_role, Role, log_audit
+from app.core.dfx import performance_monitor, reliability_guard, security_auditor, metrics_collector
+from app.core.db_utils import db_write
+from app.db.database import get_db, async_session_factory
+from app.db.tables import DeploymentRecordTable, AuditLogTable, EnvironmentConfigTable
+router = APIRouter(prefix="/deployment", tags=["系统部署与集成"])
+class EnvironmentConfig(BaseModel):
+    env_name: str = Field(..., min_length=1, max_length=64)
+    env_type: str = Field("development", pattern=r"^(development|staging|production)$")
+    variables: Dict[str, str] = Field(default_factory=dict)
+    description: Optional[str] = None
+class DockerDeployRequest(BaseModel):
+    image_tag: str = Field(..., min_length=1, max_length=256, pattern=r"^[a-zA-Z0-9._:/-]+$")
+    container_name: Optional[str] = Field(None, max_length=128, pattern=r"^[a-zA-Z0-9._-]+$")
+    ports: Dict[str, str] = Field(default_factory=lambda: {"8000": "8000"})
+    env_vars: Dict[str, str] = Field(default_factory=dict)
+    volumes: Dict[str, str] = Field(default_factory=dict)
+    restart_policy: str = Field("unless-stopped", pattern=r"^(no|always|unless-stopped|on-failure)$")
+    resource_limits: Optional[Dict[str, str]] = None
+class HuaweiCloudDeployRequest(BaseModel):
+    region: str = Field("cn-north-4", pattern=r"^cn-[a-z]+-\d+$")
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 8 */
+    instance_type: str = Field("c6.xlarge.2")
+    image_id: Optional[str] = None
+    vpc_id: Optional[str] = None
+    subnet_id: Optional[str] = None
+    security_group_id: Optional[str] = None
+    elb_enabled: bool = True
+    auto_scaling: bool = False
+    min_instances: int = Field(1, ge=1, le=100)
+    max_instances: int = Field(3, ge=1, le=100)
+    env_vars: Dict[str, str] = Field(default_factory=dict)
+class RollbackRequest(BaseModel):
+    target_version: str = Field(..., min_length=1)
+    reason: Optional[str] = None
+    force: bool = False
+    snapshot_name: Optional[str] = None
+class HealthCheckConfig(BaseModel):
+    check_interval: int = Field(30, ge=5, le=300)
+    timeout: int = Field(10, ge=1, le=60)
+    unhealthy_threshold: int = Field(3, ge=1, le=10)
+    healthy_threshold: int = Field(2, ge=1, le=10)
+    endpoints: List[str] = Field(default_factory=lambda: ["/api/v1/health"])
+class VersionSnapshot(BaseModel):
+    snapshot_name: str = Field(..., min_length=1, max_length=128)
+    description: Optional[str] = None
+def _deployment_row_to_dict(row) -> Dict:
+    return {
+        "id": row.id,
+        "deploy_type": row.deploy_type,
+        "status": row.status,
+        "config_json": row.config_json,
+        "result_json": row.result_json,
+        "version": row.version,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "created_by": row.created_by,
+        "rollback_from": row.rollback_from,
+    }
+@router.get("/health")
+async def health_check(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    checks = {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": os.getenv("APP_VERSION", "1.0.0"),
+        "uptime_seconds": time.time() - getattr(request.app.state, "start_time", time.time()),
+    }
+    db_status = "healthy"
+    try:
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 9 */
+        await db.execute(select(1))
+        checks["database"] = {"status": "healthy"}
+        try:
+            from app.config import settings
+            db_type = "postgresql" if settings.is_postgresql else "sqlite"
+            checks["database"]["type"] = db_type
+        except Exception:
+            pass
+    except Exception as exc:
+        db_status = "unhealthy"
+        checks["database"] = {"status": "unhealthy", "error": str(exc)[:200]}
+        checks["status"] = "degraded"
+    redis_status = "not_configured"
+    try:
+        cache_svc = getattr(request.app.state, "cache_service", None)
+        if cache_svc and hasattr(cache_svc, "is_redis") and cache_svc.is_redis:
+            if hasattr(cache_svc, "get_status"):
+                cs = cache_svc.get_status()
+                redis_status = "healthy" if cs.get("redis_connected") else "not_connected"
+            else:
+                redis_client = getattr(getattr(cache_svc, "_cache", None), "_redis", None) if cache_svc else None
+                if redis_client:
+                    await redis_client.ping()
+                    redis_status = "healthy"
+                else:
+                    redis_status = "not_connected"
+        elif cache_svc:
+            redis_status = "memory_fallback"
+    except Exception as exc:
+        redis_status = "unhealthy"
+        checks["status"] = "degraded"
+    checks["redis"] = {"status": redis_status}
+    chroma_status = "not_initialized"
+    try:
+        vector_store = getattr(request.app.state, "vector_store", None)
+        if vector_store:
+            if hasattr(vector_store, "get_status"):
+                vs_status = vector_store.get_status()
+                collections = vs_status.get("collections", [])
+                total_count = sum(
+                    d.get("document_count", 0) for d in vs_status.get("collection_details", {}).values()
+                )
+            else:
+                collections = list(vector_store._collections.keys())
+                total_count = 0
+                for col_name in collections:
+                    total_count += await vector_store.count(col_name)
+            chroma_status = "healthy"
+            checks["chroma"] = {"status": chroma_status, "collections": collections, "total_vectors": total_count}
+        else:
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 10 */
+            checks["chroma"] = {"status": "not_initialized"}
+    except Exception as exc:
+        chroma_status = "unhealthy"
+        checks["chroma"] = {"status": "unhealthy", "error": str(exc)[:200]}
+        checks["status"] = "degraded"
+    llm_status = "not_initialized"
+    try:
+        llm_svc = getattr(request.app.state, "llm", None)
+        if llm_svc:
+            llm_status = "healthy"
+            if hasattr(llm_svc, "usage_stats"):
+                usage = llm_svc.usage_stats
+                checks["llm"] = {
+                    "status": llm_status,
+                    "model": llm_svc.model_name,
+                    "provider": usage.get("provider", "unknown"),
+                    "request_count": usage.get("request_count", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+            else:
+                checks["llm"] = {
+                    "status": llm_status,
+                    "model": llm_svc.model_name,
+                    "provider": "deepseek" if getattr(llm_svc, "_is_deepseek", False) else "openai",
+                    "request_count": getattr(llm_svc, "_request_count", 0),
+                    "total_tokens": getattr(llm_svc, "_total_tokens", 0),
+                }
+        else:
+            checks["llm"] = {"status": "not_initialized"}
+    except Exception as exc:
+        llm_status = "unhealthy"
+        checks["llm"] = {"status": "unhealthy", "error": str(exc)[:200]}
+        checks["status"] = "degraded"
+    checks["services"] = {}
+    service_names = ["llm", "pipeline_executor", "finetune_worker", "analytics_engine", "qa_engine", "translation_engine", "content_engine"]
+    for svc in service_names:
+        svc_obj = getattr(request.app.state, svc, None)
+        checks["services"][svc] = {"status": "initialized" if svc_obj else "not_loaded"}
+    checks["system"] = {
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "cpu_count": os.cpu_count(),
+        "memory_info": "N/A",
+    }
+    status_code = 200 if checks["status"] == "healthy" else 503
+    return checks
+@router.get("/health/detailed")
+async def detailed_health_check(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 11 */
+    current_user: User = Depends(get_current_user),
+):
+    basic = await health_check(request, db)
+    component_checks = {}
+    try:
+        from app.core.pipeline_engine import PipelineExecutor
+        executor = getattr(request.app.state, "pipeline_executor", None)
+        component_checks["pipeline"] = {
+            "status": "healthy" if executor else "not_initialized",
+            "active_executions": executor.get_active_execution_count() if executor and hasattr(executor, "get_active_execution_count") else 0,
+        }
+    except Exception as exc:
+        component_checks["pipeline"] = {"status": "error", "error": str(exc)[:200]}
+    try:
+        from app.core.finetune_engine import FinetuneWorker
+        worker = getattr(request.app.state, "finetune_worker", None)
+        component_checks["finetune"] = {
+            "status": "healthy" if worker else "not_initialized",
+            "active_trainings": 0,
+        }
+    except Exception as exc:
+        component_checks["finetune"] = {"status": "error", "error": str(exc)[:200]}
+    try:
+        from app.core.analytics_engine import AnalyticsEngine
+        engine = getattr(request.app.state, "analytics_engine", None)
+        component_checks["analytics"] = {"status": "healthy" if engine else "not_initialized"}
+    except Exception as exc:
+        component_checks["analytics"] = {"status": "error", "error": str(exc)[:200]}
+    try:
+        from app.core.qa_engine import QAEngine
+        engine = getattr(request.app.state, "qa_engine", None)
+        component_checks["qa"] = {"status": "healthy" if engine else "not_initialized"}
+    except Exception as exc:
+        component_checks["qa"] = {"status": "error", "error": str(exc)[:200]}
+    basic["components"] = component_checks
+    return basic
+@router.get("/config")
+async def get_environment_config(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    config_manager = getattr(request.app.state, "env_config_manager", None) or EnvironmentConfigManager()
+    return await config_manager.get_current_config(db)
+@router.put("/config")
+async def update_environment_config(
+    request: Request,
+    data: EnvironmentConfig,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 12 */
+):
+    config_manager = getattr(request.app.state, "env_config_manager", None) or EnvironmentConfigManager()
+    result = await config_manager.update_config(db, data)
+    record_id = uuid.uuid4().hex
+    row = DeploymentRecordTable(
+        id=record_id,
+        deploy_type="config_update",
+        status="completed",
+        config_json=json.dumps(data.model_dump(), ensure_ascii=False),
+        result_json=json.dumps(result, ensure_ascii=False),
+        created_by=current_user.username if hasattr(current_user, "username") else "system",
+    )
+    async with db_write(db, operation="更新环境配置"):
+        db.add(row)
+    security_auditor.record_operation(
+        action="config_update",
+        user_id=current_user.id,
+        username=current_user.username,
+        resource=f"environment/{data.env_name}",
+        is_sensitive=True,
+    )
+    return result
+@router.get("/config/environments")
+async def list_environments(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    config_manager = getattr(request.app.state, "env_config_manager", None) or EnvironmentConfigManager()
+    return {"environments": await config_manager.list_environments(db)}
+@router.post("/config/environments", status_code=201)
+async def create_environment(
+    request: Request,
+    data: EnvironmentConfig,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    config_manager = getattr(request.app.state, "env_config_manager", None) or EnvironmentConfigManager()
+    result = await config_manager.create_environment(db, data)
+    return result
+@router.delete("/config/environments/{env_name}")
+async def delete_environment(
+    env_name: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    config_manager = getattr(request.app.state, "env_config_manager", None) or EnvironmentConfigManager()
+    result = await config_manager.delete_environment(db, env_name)
+    if not result.get("success"):
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 13 */
+        raise HTTPException(status_code=400, detail=result.get("error", "Delete failed"))
+    security_auditor.record_operation(
+        action="delete_environment",
+        user_id=current_user.id,
+        username=current_user.username,
+        resource=f"environment/{env_name}",
+        is_sensitive=True,
+    )
+    return result
+@router.post("/docker/deploy")
+async def docker_deploy(
+    request: Request,
+    data: DockerDeployRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    deploy_id = uuid.uuid4().hex
+    container_name = data.container_name or f"threat-intel-{deploy_id[:8]}"
+    row = DeploymentRecordTable(
+        id=deploy_id,
+        deploy_type="docker",
+        status="deploying",
+        config_json=json.dumps(data.model_dump(), ensure_ascii=False),
+        version=data.image_tag,
+        created_by=current_user.username if hasattr(current_user, "username") else "system",
+    )
+    async with db_write(db, operation="Docker部署"):
+        db.add(row)
+    await db.refresh(row)
+    docker_manager = getattr(request.app.state, "docker_deployment_manager", None) or DockerDeploymentManager()
+    security_auditor.record_operation(
+        action="docker_deploy",
+        user_id=current_user.id,
+        username=current_user.username,
+        resource=f"container/{container_name}",
+        detail=f"image={data.image_tag}",
+        is_sensitive=True,
+    )
+    async def _run_deploy():
+        try:
+            result = await docker_manager.deploy(data, container_name)
+            async with async_session_factory() as update_session:
+                update_result = await update_session.execute(
+                    select(DeploymentRecordTable).where(DeploymentRecordTable.id == deploy_id)
+                )
+                update_row = update_result.scalar_one_or_none()
+                if update_row:
+                    update_row.status = "completed" if result["success"] else "failed"
+                    update_row.result_json = json.dumps(result, ensure_ascii=False, default=str)
+                    update_row.completed_at = datetime.now(timezone.utc)
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 14 */
+                    await update_session.commit()
+        except Exception as exc:
+            logger.error(f"Docker deploy failed for {deploy_id}: {exc}")
+            try:
+                async with async_session_factory() as err_session:
+                    err_result = await err_session.execute(
+                        select(DeploymentRecordTable).where(DeploymentRecordTable.id == deploy_id)
+                    )
+                    err_row = err_result.scalar_one_or_none()
+                    if err_row:
+                        err_row.status = "failed"
+                        err_row.result_json = json.dumps({"success": False, "error": str(exc)[:500]}, ensure_ascii=False)
+                        err_row.completed_at = datetime.now(timezone.utc)
+                        await err_session.commit()
+            except Exception:
+                pass
+    async def _safe_deploy_task():
+        try:
+            await _run_deploy()
+        except Exception as exc:
+            logger.error(f"Deployment task failed: {exc}")
+    asyncio.create_task(_safe_deploy_task())
+    return {
+        "deploy_id": deploy_id,
+        "container_name": container_name,
+        "status": "deploying",
+        "image_tag": data.image_tag,
+        "message": "Docker deployment started",
+    }
+@router.get("/docker/containers")
+async def list_docker_containers(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    manager = getattr(request.app.state, "docker_deployment_manager", None) or DockerDeploymentManager()
+    containers = await manager.list_containers()
+    return {"containers": containers, "total": len(containers)}
+@router.post("/docker/containers/{container_id}/stop")
+async def stop_docker_container(
+    container_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    manager = getattr(request.app.state, "docker_deployment_manager", None) or DockerDeploymentManager()
+    result = await manager.stop_container(container_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail="Stop failed")
+    return result
+@router.post("/docker/containers/{container_id}/restart")
+async def restart_docker_container(
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 15 */
+    container_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    manager = getattr(request.app.state, "docker_deployment_manager", None) or DockerDeploymentManager()
+    result = await manager.restart_container(container_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "重启失败"))
+    return result
+@router.post("/huawei-cloud/deploy")
+async def huawei_cloud_deploy(
+    request: Request,
+    data: HuaweiCloudDeployRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    deploy_id = uuid.uuid4().hex
+    row = DeploymentRecordTable(
+        id=deploy_id,
+        deploy_type="huawei_cloud",
+        status="deploying",
+        config_json=json.dumps(data.model_dump(), ensure_ascii=False),
+        version=f"hc-{data.region}-{deploy_id[:8]}",
+        created_by=current_user.username if hasattr(current_user, "username") else "system",
+    )
+    async with db_write(db, operation="华为云部署"):
+        db.add(row)
+    await db.refresh(row)
+    hw_manager = getattr(request.app.state, "huawei_cloud_manager", None) or HuaweiCloudDeploymentManager()
+    security_auditor.record_operation(
+        action="huawei_cloud_deploy",
+        user_id=current_user.id,
+        username=current_user.username,
+        resource=f"huawei_cloud/{data.region}",
+        detail=f"instance_type={data.instance_type}",
+        is_sensitive=True,
+    )
+    async def _run_deploy():
+        try:
+            result = await hw_manager.deploy(data)
+            async with async_session_factory() as update_session:
+                update_result = await update_session.execute(
+                    select(DeploymentRecordTable).where(DeploymentRecordTable.id == deploy_id)
+                )
+                update_row = update_result.scalar_one_or_none()
+                if update_row:
+                    update_row.status = "completed" if result["success"] else "failed"
+                    update_row.result_json = json.dumps(result, ensure_ascii=False, default=str)
+                    update_row.completed_at = datetime.now(timezone.utc)
+                    await update_session.commit()
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 16 */
+        except Exception as exc:
+            logger.error(f"Huawei Cloud deploy failed for {deploy_id}: {exc}")
+            try:
+                async with async_session_factory() as err_session:
+                    err_result = await err_session.execute(
+                        select(DeploymentRecordTable).where(DeploymentRecordTable.id == deploy_id)
+                    )
+                    err_row = err_result.scalar_one_or_none()
+                    if err_row:
+                        err_row.status = "failed"
+                        err_row.result_json = json.dumps({"success": False, "error": str(exc)[:500]}, ensure_ascii=False)
+                        err_row.completed_at = datetime.now(timezone.utc)
+                        await err_session.commit()
+            except Exception:
+                pass
+    async def _safe_deploy_task():
+        try:
+            await _run_deploy()
+        except Exception as exc:
+            logger.error(f"Deployment task failed: {exc}")
+    asyncio.create_task(_safe_deploy_task())
+    return {
+        "deploy_id": deploy_id,
+        "status": "deploying",
+        "region": data.region,
+        "instance_type": data.instance_type,
+        "message": "Operation started",
+    }
+@router.get("/huawei-cloud/status")
+async def get_huawei_cloud_status(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    manager = getattr(request.app.state, "huawei_cloud_manager", None) or HuaweiCloudDeploymentManager()
+    status = await manager.get_status()
+    return status
+@router.get("/metrics")
+async def get_service_metrics(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    monitor = getattr(request.app.state, "service_monitor", None) or ServiceMonitor(request.app.state)
+    base_metrics = await monitor.collect_metrics(db)
+    perf_metrics = performance_monitor.get_all_metrics()
+    base_metrics["performance"] = perf_metrics
+    try:
+        from app.db.tables import RawIntelligenceTable, EntityTable, AnalyzedIntelligenceTable
+        raw_intel_count = await db.execute(select(func.count()).select_from(RawIntelligenceTable))
+        entity_count = await db.execute(select(func.count()).select_from(EntityTable))
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 17 */
+        analyzed_count = await db.execute(select(func.count()).select_from(AnalyzedIntelligenceTable))
+        deploy_count = await db.execute(select(func.count()).select_from(DeploymentRecordTable))
+        base_metrics["business"] = {
+            "raw_intelligence_count": raw_intel_count.scalar() or 0,
+            "analyzed_intelligence_count": analyzed_count.scalar() or 0,
+            "entity_count": entity_count.scalar() or 0,
+            "deployment_count": deploy_count.scalar() or 0,
+        }
+    except Exception as exc:
+        base_metrics["business"] = {"error": str(exc)[:200]}
+    try:
+        vector_store = getattr(request.app.state, "vector_store", None)
+        if vector_store:
+            vec_counts = {}
+            if hasattr(vector_store, "get_status"):
+                vs = vector_store.get_status()
+                for col_name, details in vs.get("collection_details", {}).items():
+                    vec_counts[col_name] = details.get("document_count", 0)
+            else:
+                for col_name in vector_store._collections.keys():
+                    vec_counts[col_name] = await vector_store.count(col_name)
+            base_metrics["business"]["vector_store_counts"] = vec_counts
+    except Exception:
+        pass
+    try:
+        llm_svc = getattr(request.app.state, "llm", None)
+        if llm_svc:
+            base_metrics["business"]["llm_usage"] = llm_svc.usage_stats
+    except Exception:
+        pass
+    return base_metrics
+@router.get("/metrics/history")
+async def get_metrics_history(
+    hours: int = Query(24, ge=1, le=168),
+    metric_type: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(DeploymentRecordTable).where(
+        DeploymentRecordTable.deploy_type == "metrics_snapshot"
+    ).order_by(DeploymentRecordTable.created_at.desc()).limit(hours * 2)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    history = []
+    for row in rows:
+        try:
+            data = json.loads(row.result_json) if row.result_json else {}
+            if metric_type and metric_type in data:
+                history.append({"timestamp": row.created_at.isoformat() if row.created_at else None, metric_type: data[metric_type]})
+            else:
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 18 */
+                history.append({"timestamp": row.created_at.isoformat() if row.created_at else None, **data})
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return {"history": history, "total": len(history)}
+@router.post("/rollback")
+async def rollback_deployment(
+    request: Request,
+    data: RollbackRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rollback_id = uuid.uuid4().hex
+    stmt = select(DeploymentRecordTable).where(
+        DeploymentRecordTable.version == data.target_version,
+        DeploymentRecordTable.status == "completed",
+    ).order_by(DeploymentRecordTable.created_at.desc()).limit(1)
+    result = await db.execute(stmt)
+    target_record = result.scalar_one_or_none()
+    if not target_record and not data.force:
+        raise HTTPException(status_code=404, detail=f"未找到版本 {data.target_version} 的部署记录")
+    current_version = os.getenv("APP_VERSION", "current")
+    if data.snapshot_name:
+        snapshot_id = uuid.uuid4().hex
+        snapshot_row = DeploymentRecordTable(
+            id=snapshot_id,
+            deploy_type="version_snapshot",
+            status="completed",
+            config_json=json.dumps({
+                "snapshot_name": data.snapshot_name,
+                "version": current_version,
+                "created_by": current_user.username if hasattr(current_user, "username") else "system",
+            }, ensure_ascii=False),
+            result_json=json.dumps({"snapshot_name": data.snapshot_name, "version": current_version}, ensure_ascii=False),
+            version=current_version,
+            created_by=current_user.username if hasattr(current_user, "username") else "system",
+        )
+        db.add(snapshot_row)
+    row = DeploymentRecordTable(
+        id=rollback_id,
+        deploy_type="rollback",
+        status="rolling_back",
+        config_json=json.dumps(data.model_dump(), ensure_ascii=False),
+        version=data.target_version,
+        rollback_from=current_version,
+        created_by=current_user.username if hasattr(current_user, "username") else "system",
+    )
+    async with db_write(db, operation="版本回滚"):
+        db.add(row)
+    await db.refresh(row)
+    rollback_manager = getattr(request.app.state, "rollback_manager", None) or RollbackManager()
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 19 */
+    target_config = {}
+    if target_record and target_record.config_json:
+        try:
+            target_config = json.loads(target_record.config_json)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=422, detail="配置JSON格式错误")
+    security_auditor.record_operation(
+        action="rollback" if not data.force else "force_rollback",
+        user_id=current_user.id,
+        username=current_user.username,
+        resource=f"version/{data.target_version}",
+        detail=f"reason={data.reason}, force={data.force}, from={current_version}",
+        is_sensitive=True,
+    )
+    async def _run_rollback():
+        try:
+            result = await rollback_manager.execute_rollback(
+                target_version=data.target_version,
+                target_config=target_config,
+                reason=data.reason,
+                force=data.force,
+            )
+            async with async_session_factory() as update_session:
+                update_result = await update_session.execute(
+                    select(DeploymentRecordTable).where(DeploymentRecordTable.id == rollback_id)
+                )
+                update_row = update_result.scalar_one_or_none()
+                if update_row:
+                    update_row.status = "completed" if result["success"] else "failed"
+                    update_row.result_json = json.dumps(result, ensure_ascii=False, default=str)
+                    update_row.completed_at = datetime.now(timezone.utc)
+                    await update_session.commit()
+        except Exception as exc:
+            logger.error(f"Rollback failed for {rollback_id}: {exc}")
+            try:
+                async with async_session_factory() as err_session:
+                    err_result = await err_session.execute(
+                        select(DeploymentRecordTable).where(DeploymentRecordTable.id == rollback_id)
+                    )
+                    err_row = err_result.scalar_one_or_none()
+                    if err_row:
+                        err_row.status = "failed"
+                        err_row.result_json = json.dumps({"success": False, "error": str(exc)[:500]}, ensure_ascii=False)
+                        err_row.completed_at = datetime.now(timezone.utc)
+                        await err_session.commit()
+            except Exception:
+                pass
+    async def _safe_rollback_task():
+        try:
+            await _run_rollback()
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 20 */
+        except Exception as exc:
+            logger.error(f"Deployment task failed: {exc}")
+    asyncio.create_task(_safe_rollback_task())
+    return {
+        "rollback_id": rollback_id,
+        "target_version": data.target_version,
+        "status": "rolling_back",
+        "reason": data.reason,
+        "snapshot_created": bool(data.snapshot_name),
+        "snapshot_name": data.snapshot_name,
+        "rollback_from": current_version,
+        "message": "Operation started"
+    }
+@router.get("/status")
+async def get_deployment_status(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(DeploymentRecordTable).order_by(DeploymentRecordTable.created_at.desc()).limit(10)
+    result = await db.execute(stmt)
+    recent = result.scalars().all()
+    status_counts_stmt = select(
+        DeploymentRecordTable.status,
+        func.count(DeploymentRecordTable.id),
+    ).group_by(DeploymentRecordTable.status)
+    status_result = await db.execute(status_counts_stmt)
+    status_counts = {row[0]: row[1] for row in status_result.all()}
+    current_version = os.getenv("APP_VERSION", "1.0.0")
+    return {
+        "current_version": current_version,
+        "status_counts": status_counts,
+        "recent_deployments": [_deployment_row_to_dict(r) for r in recent],
+        "system_health": "healthy",
+    }
+@router.get("/deployments")
+async def list_deployments(
+    deploy_type: Optional[str] = None,
+    status: Optional[str] = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(DeploymentRecordTable)
+    count_stmt = select(func.count()).select_from(DeploymentRecordTable)
+    if deploy_type:
+        stmt = stmt.where(DeploymentRecordTable.deploy_type == deploy_type)
+        count_stmt = count_stmt.where(DeploymentRecordTable.deploy_type == deploy_type)
+    if status:
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 21 */
+        stmt = stmt.where(DeploymentRecordTable.status == status)
+        count_stmt = count_stmt.where(DeploymentRecordTable.status == status)
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
+    stmt = stmt.order_by(DeploymentRecordTable.created_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    return {"items": [_deployment_row_to_dict(r) for r in rows], "total": total, "offset": offset, "limit": limit}
+@router.get("/deployments/{deploy_id}")
+async def get_deployment(
+    deploy_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(DeploymentRecordTable).where(DeploymentRecordTable.id == deploy_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Deployment record not found")
+    return _deployment_row_to_dict(row)
+@router.post("/health-check/config", status_code=201)
+async def configure_health_check(
+    data: HealthCheckConfig,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    if not isinstance(data.check_interval, int) or data.check_interval < 5:
+        raise HTTPException(status_code=422, detail="check_interval必须为不小于5的整数")
+    if not isinstance(data.timeout, int) or data.timeout < 1:
+        raise HTTPException(status_code=422, detail="timeout必须为不小于1的整数")
+    if not isinstance(data.unhealthy_threshold, int) or data.unhealthy_threshold < 1:
+        raise HTTPException(status_code=422, detail="unhealthy_threshold必须为不小于1的整数")
+    if not isinstance(data.healthy_threshold, int) or data.healthy_threshold < 1:
+        raise HTTPException(status_code=422, detail="healthy_threshold必须为不小于1的整数")
+    if not isinstance(data.endpoints, list) or len(data.endpoints) == 0:
+        raise HTTPException(status_code=422, detail="endpoints必须为非空列表")
+    for ep in data.endpoints:
+        if not isinstance(ep, str) or not ep.startswith("/"):
+            raise HTTPException(status_code=422, detail=f"无效的健康检查端点: {ep}")
+    if data.timeout >= data.check_interval:
+        raise HTTPException(status_code=422, detail="timeout必须小于check_interval")
+    request.app.state.health_check_config = data.model_dump()
+    return {"success": True, "config": data.model_dump()}
+@router.get("/versions")
+async def list_available_versions(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(DeploymentRecordTable).where(
+        DeploymentRecordTable.status == "completed",
+        DeploymentRecordTable.deploy_type.in_(["docker", "huawei_cloud"]),
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 22 */
+    ).order_by(DeploymentRecordTable.created_at.desc()).limit(20)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    versions = []
+    for row in rows:
+        versions.append({
+            "version": row.version,
+            "deploy_type": row.deploy_type,
+            "deployed_at": row.created_at.isoformat() if row.created_at else None,
+            "deploy_id": row.id,
+        })
+    return {"versions": versions, "total": len(versions)}
+@router.post("/versions/snapshot", status_code=201)
+async def create_version_snapshot(
+    data: VersionSnapshot,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    current_version = os.getenv("APP_VERSION", "1.0.0")
+    snapshot_id = uuid.uuid4().hex
+    row = DeploymentRecordTable(
+        id=snapshot_id,
+        deploy_type="version_snapshot",
+        status="completed",
+        config_json=json.dumps({
+            "snapshot_name": data.snapshot_name,
+            "version": current_version,
+            "description": data.description,
+            "created_by": current_user.username if hasattr(current_user, "username") else "system",
+        }, ensure_ascii=False),
+        result_json=json.dumps({
+            "snapshot_name": data.snapshot_name,
+            "version": current_version,
+            "description": data.description,
+        }, ensure_ascii=False),
+        version=current_version,
+        created_by=current_user.username if hasattr(current_user, "username") else "system",
+    )
+    async with db_write(db, operation="创建版本快照"):
+        db.add(row)
+    security_auditor.record_operation(
+        action="version_snapshot",
+        user_id=current_user.id,
+        username=current_user.username,
+        resource=f"snapshot/{data.snapshot_name}",
+        detail=f"version={current_version}",
+    )
+    return {
+        "success": True,
+        "snapshot_id": snapshot_id,
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 23 */
+        "snapshot_name": data.snapshot_name,
+        "version": current_version,
+    }
+@router.get("/versions/snapshots")
+async def list_version_snapshots(
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(DeploymentRecordTable).where(
+        DeploymentRecordTable.deploy_type == "version_snapshot",
+    ).order_by(DeploymentRecordTable.created_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    snapshots = []
+    for row in rows:
+        try:
+            config = json.loads(row.config_json) if row.config_json else {}
+            snapshots.append({
+                "snapshot_id": row.id,
+                "snapshot_name": config.get("snapshot_name", ""),
+                "version": row.version,
+                "description": config.get("description"),
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "created_by": row.created_by,
+            })
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return {"snapshots": snapshots, "total": len(snapshots)}
+@router.get("/components")
+async def get_components_status(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    components = {}
+    db_info = {"name": "database", "status": "unknown", "type": "unknown"}
+    try:
+        await db.execute(select(1))
+        db_info["status"] = "healthy"
+        from app.config import settings
+        db_info["type"] = "postgresql" if settings.is_postgresql else "sqlite"
+    except Exception as exc:
+        db_info["status"] = "unhealthy"
+        db_info["error"] = str(exc)[:200]
+    components["database"] = db_info
+    redis_info = {"name": "redis", "status": "not_configured"}
+    try:
+        cache_svc = getattr(request.app.state, "cache_service", None)
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 24 */
+        if cache_svc:
+            if cache_svc.is_redis:
+                redis_client = getattr(getattr(cache_svc, "_cache", None), "_redis", None) if cache_svc else None
+                if redis_client:
+                    await redis_client.ping()
+                    redis_info["status"] = "healthy"
+                    info = await redis_client.info()
+                    redis_info["used_memory_human"] = info.get("used_memory_human")
+                    redis_info["connected_clients"] = info.get("connected_clients")
+                    redis_info["uptime_in_seconds"] = info.get("uptime_in_seconds")
+                else:
+                    redis_info["status"] = "not_connected"
+            else:
+                redis_info["status"] = "memory_fallback"
+    except Exception as exc:
+        redis_info["status"] = "unhealthy"
+        redis_info["error"] = str(exc)[:200]
+    components["redis"] = redis_info
+    chroma_info = {"name": "chroma", "status": "not_initialized"}
+    try:
+        vector_store = getattr(request.app.state, "vector_store", None)
+        if vector_store:
+            collections_info = {}
+            if hasattr(vector_store, "get_status"):
+                vs = vector_store.get_status()
+                for col_name, details in vs.get("collection_details", {}).items():
+                    collections_info[col_name] = details.get("document_count", 0)
+                chroma_info["persist_dir"] = vs.get("persist_dir", "")
+            else:
+                for col_name in vector_store._collections.keys():
+                    count = await vector_store.count(col_name)
+                    collections_info[col_name] = count
+                chroma_info["persist_dir"] = vector_store.persist_dir
+            chroma_info["status"] = "healthy"
+            chroma_info["collections"] = collections_info
+        else:
+            chroma_info["status"] = "not_initialized"
+    except Exception as exc:
+        chroma_info["status"] = "unhealthy"
+        chroma_info["error"] = str(exc)[:200]
+    components["chroma"] = chroma_info
+    llm_info = {"name": "llm", "status": "not_initialized"}
+    try:
+        llm_svc = getattr(request.app.state, "llm", None)
+        if llm_svc:
+            llm_info["status"] = "healthy"
+            llm_info["model"] = llm_svc.model_name
+            if hasattr(llm_svc, "usage_stats"):
+                usage = llm_svc.usage_stats
+                llm_info["provider"] = usage.get("provider", "unknown")
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 25 */
+                llm_info["request_count"] = usage.get("request_count", 0)
+                llm_info["total_tokens"] = usage.get("total_tokens", 0)
+            else:
+                llm_info["provider"] = "deepseek" if getattr(llm_svc, "_is_deepseek", False) else "openai"
+                llm_info["request_count"] = getattr(llm_svc, "_request_count", 0)
+                llm_info["total_tokens"] = getattr(llm_svc, "_total_tokens", 0)
+            llm_info["available_models"] = [m["model_id"] for m in llm_svc.list_models()]
+        else:
+            llm_info["status"] = "not_initialized"
+    except Exception as exc:
+        llm_info["status"] = "unhealthy"
+        llm_info["error"] = str(exc)[:200]
+    components["llm"] = llm_info
+    service_names = [
+        ("pipeline_executor", "pipeline"),
+        ("finetune_worker", "finetune"),
+        ("analytics_engine", "analytics"),
+        ("qa_engine", "qa"),
+        ("translation_engine", "translation"),
+        ("content_engine", "content"),
+    ]
+    for attr_name, display_name in service_names:
+        svc = getattr(request.app.state, attr_name, None)
+        components[display_name] = {
+            "name": display_name,
+            "status": "running" if svc else "stopped",
+            "type": type(svc).__name__ if svc else "N/A",
+        }
+    healthy_count = sum(1 for c in components.values() if c.get("status") in ("healthy", "running"))
+    total_count = len(components)
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "overall_status": "healthy" if healthy_count == total_count else "degraded",
+        "healthy_count": healthy_count,
+        "total_count": total_count,
+        "components": components,
+    }
+@router.get("/performance")
+async def get_performance_metrics(
+    endpoint: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+):
+    if endpoint:
+        metrics = performance_monitor.get_endpoint_metrics(endpoint)
+        return {"endpoint": metrics}
+    all_metrics = performance_monitor.get_all_metrics()
+    cb_status = reliability_guard.get_all_circuit_breaker_status()
+    all_metrics["circuit_breakers"] = cb_status
+    return all_metrics
+@router.get("/security")
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 26 */
+async def get_security_status(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    security_summary = security_auditor.get_security_summary()
+    auth_status = {
+        "jwt_enabled": True,
+        "totp_available": True,
+        "token_blacklist_enabled": True,
+        "password_policy": {
+            "min_length": 6,
+        },
+    }
+    from app.core.rate_limiter import rate_limiter
+    rl_status = rate_limiter.get_status() if hasattr(rate_limiter, "get_status") else {}
+    rate_limit_status = {
+        "enabled": True,
+        "requests_per_minute": rl_status.get("requests_per_minute", getattr(rate_limiter, "requests_per_minute", 60)),
+        "active_ip_buckets": rl_status.get("active_ip_buckets", 0),
+        "active_user_buckets": rl_status.get("active_user_buckets", 0),
+    }
+    audit_stats = {"total_records": 0, "last_24h_count": 0, "top_actions": {}}
+    try:
+        total_result = await db.execute(select(func.count()).select_from(AuditLogTable))
+        audit_stats["total_records"] = total_result.scalar() or 0
+        from datetime import timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent_result = await db.execute(
+            select(func.count()).select_from(AuditLogTable).where(AuditLogTable.created_at >= cutoff)
+        )
+        audit_stats["last_24h_count"] = recent_result.scalar() or 0
+        top_actions_result = await db.execute(
+            select(AuditLogTable.action, func.count(AuditLogTable.id).label("count"))
+            .group_by(AuditLogTable.action)
+            .order_by(func.count(AuditLogTable.id).desc())
+            .limit(10)
+        )
+        audit_stats["top_actions"] = {row[0]: row[1] for row in top_actions_result.all()}
+    except Exception as exc:
+        audit_stats["error"] = str(exc)[:200]
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "authentication": auth_status,
+        "rate_limiting": rate_limit_status,
+        "audit_log": audit_stats,
+        "security_auditor": security_summary,
+    }
+@router.get("/compatibility")
+async def check_compatibility(
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 27 */
+    current_user: User = Depends(get_current_user),
+):
+    results = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "python_version": sys.version,
+        "python_required": ">=3.10",
+        "python_compatible": sys.version_info >= (3, 10),
+        "platform": platform.platform(),
+        "packages": {},
+        "services": {},
+    }
+    package_checks = {
+        "fastapi": "fastapi",
+        "uvicorn": "uvicorn",
+        "sqlalchemy": "sqlalchemy",
+        "pydantic": "pydantic",
+        "chromadb": "chromadb",
+        "httpx": "httpx",
+        "loguru": "loguru",
+        "jose": "python-jose",
+        "passlib": "passlib",
+    }
+    for import_name, package_name in package_checks.items():
+        try:
+            mod = __import__(import_name)
+            version = getattr(mod, "__version__", "unknown")
+            results["packages"][package_name] = {"installed": True, "version": version}
+        except ImportError:
+            results["packages"][package_name] = {"installed": False, "version": None}
+    try:
+        import redis
+        results["services"]["redis_library"] = {"installed": True, "version": getattr(redis, "__version__", "unknown")}
+    except ImportError:
+        results["services"]["redis_library"] = {"installed": False}
+    try:
+        import asyncpg
+        results["services"]["asyncpg"] = {"installed": True, "version": getattr(asyncpg, "__version__", "unknown")}
+    except ImportError:
+        results["services"]["asyncpg"] = {"installed": False}
+    try:
+        import aiosqlite
+        results["services"]["aiosqlite"] = {"installed": True, "version": getattr(aiosqlite, "__version__", "unknown")}
+    except ImportError:
+        results["services"]["aiosqlite"] = {"installed": False}
+    docker_available = False
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "docker", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 28 */
+        )
+        stdout, _ = await process.communicate()
+        if process.returncode == 0:
+            docker_available = True
+            results["services"]["docker"] = {"installed": True, "version": stdout.decode().strip()}
+    except Exception:
+        pass
+    if not docker_available:
+        results["services"]["docker"] = {"installed": False}
+    all_packages_installed = all(p["installed"] for p in results["packages"].values())
+    results["overall_compatible"] = results["python_compatible"] and all_packages_installed
+    return results
+@router.get("/metrics/prometheus")
+async def get_prometheus_metrics(
+    current_user: User = Depends(get_current_user),
+):
+    from fastapi.responses import PlainTextResponse
+    content = metrics_collector.generate_prometheus_metrics()
+    return PlainTextResponse(content=content, media_type="text/plain; version=0.0.4; charset=utf-8")
+@router.get("/templates/dockerfile")
+async def generate_dockerfile(
+    current_user: User = Depends(get_current_user),
+):
+    dockerfile = '''FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    gcc g++ && \\
+    rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN mkdir -p /app/chroma_data /app/graph_data /app/model_data /app/checkpoints /app/logs
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \\
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+'''
+    return {"template": "Dockerfile", "content": dockerfile}
+@router.get("/templates/docker-compose")
+async def generate_docker_compose(
+    current_user: User = Depends(get_current_user),
+):
+    compose = '''version: "3.8"
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 29 */
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com/v1}
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-deepseek-chat}
+      - DATABASE_URL=postgresql+asyncpg://:5432/threatintel
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+    volumes:
+      - ./chroma_data:/app/chroma_data
+      - ./graph_data:/app/graph_data
+      - ./model_data:/app/model_data
+      - ./checkpoints:/app/checkpoints
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: threatintel
+      POSTGRES_USER: threatintel
+      POSTGRES_PASSWORD: threatintel
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threatintel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 30 */
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+volumes:
+  pgdata:
+  redisdata:
+'''
+    return {"template": "docker-compose.yml", "content": compose}
+@router.get("/templates/huawei-cloud")
+async def generate_huawei_cloud_template(
+    region: str = Query("cn-north-4"),
+    instance_type: str = Query("c6.xlarge.2"),
+    current_user: User = Depends(get_current_user),
+):
+    template = {
+        "resource_provider": "华为云 Huaweicloud Provider",
+        "region": region,
+        "instance_type": instance_type,
+        "steps": [
+            {"step": 1, "action": "安装华为云CLI", "command": "pip install hcloud"},
+            {"step": 2, "action": "配置认证信息", "command": f"hcloud configure --cli-profile threat-intel --region {region}"},
+            {"step": 3, "action": "创建VPC网络", "command": f"hcloud VPC CreateVpc --region {region} --name threat-intel-vpc"},
+            {"step": 4, "action": "创建子网", "command": f"hcloud VPC CreateSubnet --region {region} --vpc-id <VPC_ID> --name threat-intel-subnet"},
+            {"step": 5, "action": "创建安全组", "command": f"hcloud VPC CreateSecurityGroup --region {region} --name threat-intel-sg"},
+            {"step": 6, "action": "创建ECS实例", "command": f"hcloud ECS CreateServers --region {region} --flavor {instance_type} --image <IMAGE_ID>"},
+            {"step": 7, "action": "配置ELB负载均衡", "command": f"hcloud ELB CreateLoadBalancer --region {region}"},
+            {"step": 8, "action": "部署应用", "command": "docker-compose up -d"},
+            {"step": 9, "action": "验证部署", "command": "curl https://<ELB_IP>/health"},
+        ],
+        "env_vars_required": [
+            "HW_ACCESS_KEY", "HW_SECRET_KEY", "HW_REGION", "HW_PROJECT_ID",
+            "LLM_API_KEY", "SECRET_KEY",
+        ],
+        "recommended_specs": {
+            "minimum": {"cpu": 4, "memory": "16GB", "disk": "100GB", "gpu": "无"},
+            "recommended": {"cpu": 8, "memory": "32GB", "disk": "500GB", "gpu": "NVIDIA T4 (微调任务)"},
+        },
+    }
+    return template
+class EnvironmentConfigManager:
+    def __init__(self):
+        self._current_env = os.getenv("APP_ENV", "development")
+    async def _ensure_defaults(self, db: AsyncSession):
+        default_envs = [
+            {
+                "env_name": "development",
+                "env_type": "development",
+
+/* ............................................................ 中间代码省略 ............................................................ */
+
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 31 */
+# ============================================================
+# File: core/tenant_manager.py
+# ============================================================
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
+from loguru import logger
+from sqlalchemy import select
+from app.db.tables import TenantTable
+class TenantManager:
+    def __init__(self):
+        self._cache: Dict[str, Dict] = {}
+    async def get_tenant(self, tenant_id: str, db_session=None) -> Optional[Dict]:
+        if tenant_id in self._cache:
+            return self._cache[tenant_id]
+        if db_session is None:
+            from app.db.database import async_session_factory
+            async with async_session_factory() as session:
+                return await self.get_tenant(tenant_id, db_session=session)
+        try:
+            result = await db_session.execute(
+                select(TenantTable).where(TenantTable.id == tenant_id, TenantTable.is_deleted == False)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            data = {
+                "id": row.id,
+                "name": row.name,
+                "plan": row.plan,
+                "is_active": not row.is_deleted,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            self._cache[tenant_id] = data
+            return data
+        except Exception as exc:
+            logger.warning(f"TenantManager.get_tenant failed: {exc}")
+            return None
+    async def list_tenants(self, db_session=None) -> List[Dict]:
+        if db_session is None:
+            from app.db.database import async_session_factory
+            async with async_session_factory() as session:
+                return await self.list_tenants(db_session=session)
+        try:
+            result = await db_session.execute(
+                select(TenantTable).where(TenantTable.is_deleted == False)
+            )
+            rows = result.scalars().all()
+            return [
+                {
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 32 */
+                    "id": r.id,
+                    "name": r.name,
+                    "plan": r.plan,
+                    "is_active": not r.is_deleted,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+        except Exception as exc:
+            logger.warning(f"TenantManager.list_tenants failed: {exc}")
+            return []
+    async def create_tenant(self, name: str, plan: str = "free", db_session=None) -> Dict:
+        if db_session is None:
+            from app.db.database import async_session_factory
+            async with async_session_factory() as session:
+                return await self.create_tenant(name, plan, db_session=session)
+        tenant_id = uuid4().hex
+        try:
+            row = TenantTable(
+                id=tenant_id,
+                name=name,
+                plan=plan,
+                is_deleted=False,
+                created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            db_session.add(row)
+            await db_session.commit()
+            data = {"id": tenant_id, "name": name, "plan": plan, "is_active": True}
+            self._cache[tenant_id] = data
+            return data
+        except Exception as exc:
+            logger.warning(f"TenantManager.create_tenant failed: {exc}")
+            return {"id": tenant_id, "name": name, "plan": plan, "is_active": True}
+    async def update_tenant(self, tenant_id: str, db_session=None, **kwargs) -> bool:
+        if db_session is None:
+            from app.db.database import async_session_factory
+            async with async_session_factory() as session:
+                return await self.update_tenant(tenant_id, db_session=session, **kwargs)
+        try:
+            result = await db_session.execute(
+                select(TenantTable).where(TenantTable.id == tenant_id)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            for k, v in kwargs.items():
+                if hasattr(row, k):
+                    setattr(row, k, v)
+            await db_session.commit()
+            self._cache.pop(tenant_id, None)
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 33 */
+            return True
+        except Exception as exc:
+            logger.warning(f"TenantManager.update_tenant failed: {exc}")
+            return False
+    async def delete_tenant(self, tenant_id: str, db_session=None) -> bool:
+        return await self.update_tenant(tenant_id, db_session=db_session, is_deleted=True)
+# ============================================================
+# File: core/tenant_middleware.py
+# ============================================================
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from loguru import logger
+from app.core.tenant import tenant_manager
+from app.core.billing import ResourceType
+_PUBLIC_PATHS = {"/health", "/health/live", "/health/ready", "/metrics", "/docs", "/redoc", "/openapi.json", "/api/v1/version"}
+class TenantMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in _PUBLIC_PATHS:
+            return await call_next(request)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        tenant_id = await self._extract_tenant_id(request)
+        request.state.tenant_id = tenant_id
+        quota_ok = await self._check_quota(tenant_id, request)
+        if not quota_ok:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Tenant quota exceeded", "tenant_id": tenant_id},
+            )
+        response = await call_next(request)
+        self._record_usage(request, tenant_id)
+        return response
+    async def _extract_tenant_id(self, request: Request) -> str:
+        tenant_id = request.headers.get("X-Tenant-ID")
+        if tenant_id:
+            return tenant_id
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            try:
+                from app.core.auth import decode_access_token
+                token = auth_header[7:]
+                token_data = decode_access_token(token)
+                if hasattr(token_data, "tenant_id") and token_data.tenant_id:
+                    return token_data.tenant_id
+            except Exception:
+                pass
+        api_key_header = request.headers.get("X-API-Key")
+        if api_key_header:
+            try:
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 34 */
+                from app.core.api_key_manager import api_key_manager
+                api_key = await api_key_manager.validate_api_key(api_key_header)
+                if api_key and api_key.tenant_id:
+                    return api_key.tenant_id
+            except Exception:
+                pass
+        return "default"
+    async def _check_quota(self, tenant_id: str, request: Request) -> bool:
+        try:
+            if request.method in ("POST", "PUT", "PATCH"):
+                ok = await tenant_manager.check_quota(tenant_id, "intelligence_count")
+                if not ok:
+                    return False
+            ok = await tenant_manager.check_quota(tenant_id, "api_call_count")
+            if not ok:
+                return False
+        except Exception as exc:
+            logger.warning(f"Quota check failed for tenant {tenant_id}: {exc}")
+        return True
+    def _record_usage(self, request: Request, tenant_id: str):
+        try:
+            billing_engine = getattr(request.app.state, "billing_engine", None)
+            if billing_engine:
+                billing_engine.record_usage(
+                    tenant_id=tenant_id,
+                    resource_type=ResourceType.API_CALL.value,
+                    amount=1,
+                    metadata={"path": request.url.path, "method": request.method},
+                )
+        except Exception as exc:
+            logger.warning(f"Usage recording failed for tenant {tenant_id}: {exc}")
+# ============================================================
+# File: core/cache_service.py
+# ============================================================
+"""
+CacheService — 统一缓存服务
+支持Redis（生产）和内存缓存（开发回退）
+"""
+import hashlib
+import json
+import time
+from typing import Any, Dict, Optional
+from loguru import logger
+from app.config import settings
+class MemoryCache:
+    def __init__(self, default_ttl: int = 300):
+        self._store: Dict[str, tuple[Any, float]] = {}
+        self.default_ttl = default_ttl
+        self._max_size = 10000
+    async def get(self, key: str) -> Optional[Any]:
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 35 */
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        value, expire_at = entry
+        if time.time() > expire_at:
+            del self._store[key]
+            return None
+        return value
+    async def set(self, key: str, value: Any, ttl: Optional[int] = None):
+        if len(self._store) >= self._max_size:
+            oldest_key = next(iter(self._store))
+            del self._store[oldest_key]
+        expire_at = time.time() + (ttl or self.default_ttl)
+        self._store[key] = (value, expire_at)
+    async def delete(self, key: str):
+        self._store.pop(key, None)
+    async def exists(self, key: str) -> bool:
+        entry = self._store.get(key)
+        if entry is None:
+            return False
+        _, expire_at = entry
+        if time.time() > expire_at:
+            del self._store[key]
+            return False
+        return True
+    async def clear(self, prefix: str = ""):
+        if prefix:
+            keys_to_delete = [k for k in self._store if k.startswith(prefix)]
+            for k in keys_to_delete:
+                del self._store[k]
+        else:
+            self._store.clear()
+    async def cleanup_expired(self):
+        now = time.time()
+        expired = [k for k, (_, exp) in self._store.items() if now > exp]
+        for k in expired:
+            del self._store[k]
+        return len(expired)
+class RedisCache:
+    def __init__(self, redis_url: str, prefix: str = "cache:", default_ttl: int = 300):
+        self._url = redis_url
+        self._prefix = prefix
+        self.default_ttl = default_ttl
+        self._redis = None
+    async def _get_redis(self):
+        if self._redis is None:
+            try:
+                import redis.asyncio as aioredis
+                self._redis = aioredis.from_url(self._url, decode_responses=True)
+                await self._redis.ping()
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 36 */
+                logger.info(f"Redis connected: {self._url[:30]}...")
+            except Exception as exc:
+                logger.error(f"Redis connection failed: {exc}")
+                raise
+        return self._redis
+    def _key(self, key: str) -> str:
+        return f"{self._prefix}{key}"
+    async def get(self, key: str) -> Optional[Any]:
+        try:
+            r = await self._get_redis()
+            value = await r.get(self._key(key))
+            if value is None:
+                return None
+            return json.loads(value)
+        except Exception as exc:
+            logger.warning(f"Redis get failed: {exc}")
+            return None
+    async def set(self, key: str, value: Any, ttl: Optional[int] = None):
+        try:
+            r = await self._get_redis()
+            serialized = json.dumps(value, ensure_ascii=False, default=str)
+            await r.setex(self._key(key), ttl or self.default_ttl, serialized)
+        except Exception as exc:
+            logger.warning(f"Redis set failed: {exc}")
+    async def delete(self, key: str):
+        try:
+            r = await self._get_redis()
+            await r.delete(self._key(key))
+        except Exception as exc:
+            logger.warning(f"Redis delete failed: {exc}")
+    async def exists(self, key: str) -> bool:
+        try:
+            r = await self._get_redis()
+            return bool(await r.exists(self._key(key)))
+        except Exception:
+            return False
+    async def clear(self, prefix: str = ""):
+        try:
+            r = await self._get_redis()
+            pattern = f"{self._prefix}{prefix}*"
+            keys = []
+            async for key in r.scan_iter(match=pattern):
+                keys.append(key)
+            if keys:
+                await r.delete(*keys)
+        except Exception as exc:
+            logger.warning(f"Redis clear failed: {exc}")
+    async def close(self):
+        if self._redis:
+            await self._redis.close()
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 37 */
+            self._redis = None
+class CacheService:
+    def __init__(self):
+        self._cache: Optional[RedisCache | MemoryCache] = None
+        self._is_redis = False
+    async def initialize(self):
+        if settings.redis_enabled:
+            try:
+                self._cache = RedisCache(
+                    redis_url=settings.REDIS_URL,
+                    prefix=settings.REDIS_CACHE_PREFIX,
+                    default_ttl=settings.REDIS_CACHE_TTL,
+                )
+                await self._cache._get_redis()
+                self._is_redis = True
+                logger.info("CacheService: Redis mode")
+            except Exception as exc:
+                if settings.is_production:
+                    logger.error(f"Redis init failed in production mode — cache is REQUIRED: {exc}")
+                    raise RuntimeError(
+                        "Redis is required in production environment. "
+                        "Set REDIS_URL environment variable and ensure Redis is running."
+                    ) from exc
+                logger.warning(f"Redis init failed, falling back to memory cache: {exc}")
+                self._cache = MemoryCache(default_ttl=settings.REDIS_CACHE_TTL)
+                self._is_redis = False
+        else:
+            if settings.is_production:
+                raise RuntimeError(
+                    "Redis is required in production environment. "
+                    "Set REDIS_ENABLED=true and REDIS_URL environment variables."
+                )
+            self._cache = MemoryCache(default_ttl=settings.REDIS_CACHE_TTL)
+            self._is_redis = False
+            logger.info("CacheService: Memory mode (no Redis configured)")
+    @staticmethod
+    def make_key(*parts: str) -> str:
+        combined = ":".join(str(p) for p in parts)
+        if len(combined) > 200:
+            return hashlib.md5(combined.encode()).hexdigest()
+        return combined
+    async def get(self, key: str) -> Optional[Any]:
+        return await self._cache.get(key)
+    async def set(self, key: str, value: Any, ttl: Optional[int] = None):
+        await self._cache.set(key, value, ttl)
+    async def delete(self, key: str):
+        await self._cache.delete(key)
+    async def exists(self, key: str) -> bool:
+        return await self._cache.exists(key)
+    async def clear(self, prefix: str = ""):
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 38 */
+        await self._cache.clear(prefix)
+    async def get_or_set(self, key: str, factory, ttl: Optional[int] = None) -> Any:
+        cached = await self.get(key)
+        if cached is not None:
+            return cached
+        value = await factory() if callable(factory) else factory
+        await self.set(key, value, ttl)
+        return value
+    async def close(self):
+        if self._cache and isinstance(self._cache, RedisCache):
+            await self._cache.close()
+    @property
+    def is_redis(self) -> bool:
+        return self._is_redis
+cache_service = CacheService()
+# ============================================================
+# File: core/metrics.py
+# ============================================================
+from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
+from starlette.responses import Response
+REQUEST_COUNT = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status']
+)
+REQUEST_DURATION = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration',
+    ['method', 'endpoint'],
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+)
+LLM_CALL_COUNT = Counter(
+    'llm_calls_total',
+    'Total LLM API calls',
+    ['model', 'status']
+)
+LLM_CALL_DURATION = Histogram(
+    'llm_call_duration_seconds',
+    'LLM API call duration',
+    ['model']
+)
+LLM_TOKENS_USED = Counter(
+    'llm_tokens_total',
+    'Total LLM tokens used',
+    ['model', 'type']
+)
+INTELLIGENCE_COLLECTED = Counter(
+    'intelligence_collected_total',
+    'Total intelligence items collected',
+    ['source', 'status']
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 39 */
+)
+ENTITY_COUNT = Gauge(
+    'knowledge_graph_entities',
+    'Number of entities in knowledge graph',
+    ['entity_type']
+)
+RELATION_COUNT = Gauge(
+    'knowledge_graph_relations',
+    'Number of relations in knowledge graph'
+)
+ACTIVE_ORGANISMS = Gauge(
+    'intelligence_organisms_active',
+    'Number of active intelligence organisms'
+)
+VECTOR_STORE_SIZE = Gauge(
+    'vector_store_documents',
+    'Number of documents in vector store',
+    ['collection']
+)
+CIRCUIT_BREAKER_STATE = Gauge(
+    'circuit_breaker_open',
+    'Whether circuit breaker is open',
+    ['service']
+)
+APP_INFO = Info(
+    'threat_intel_app',
+    'Application information'
+)
+def metrics_endpoint():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+# ============================================================
+# File: core/metrics_middleware.py
+# ============================================================
+import time
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+from app.core.metrics import REQUEST_COUNT, REQUEST_DURATION
+class PrometheusMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> Response:
+        path = request.url.path
+        method = request.method
+        if path in ("/metrics", "/health", "/health/live", "/health/ready"):
+            return await call_next(request)
+        start_time = time.monotonic()
+        response = await call_next(request)
+        duration = time.monotonic() - start_time
+        status = str(response.status_code)
+        REQUEST_COUNT.labels(method=method, endpoint=path, status=status).inc()
+        REQUEST_DURATION.labels(method=method, endpoint=path).observe(duration)
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 40 */
+        return response
+// ============================================================
+// File: pages/Login.tsx
+// ============================================================
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Input, Button } from 'antd';
+import { UserOutlined, LockOutlined, SafetyOutlined } from '@ant-design/icons';
+import { useNavigate } from 'react-router-dom';
+import { authApi, getErrorMessage } from '../services/api';
+import { tokenStorage } from '../utils/tokenStorage';
+import { useAntdMessage } from '../utils/hooks';
+const REMEMBER_KEY = 'threatintel_remember_user';
+const FEATURES = [
+  { title: '实时威胁监控', desc: '多源情报实时采集与智能分析', color: '#6C5CE7', icon: 'shield' },
+  { title: '知识图谱关联', desc: '实体关系深度挖掘与可视化', color: '#0090FF', icon: 'graph' },
+  { title: 'AI智能研判', desc: '大模型驱动的深度情报分析', color: '#30A46C', icon: 'brain' },
+  { title: '攻击链预测', desc: '基于马尔可夫链的攻击趋势预判', color: '#E5484D', icon: 'target' },
+];
+const PARTICLE_COLORS = [
+  'rgba(108,92,231,',
+  'rgba(0,144,255,',
+  'rgba(48,164,108,',
+  'rgba(108,92,231,',
+  'rgba(90,75,214,',
+];
+interface Particle {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  radius: number;
+  colorBase: string;
+  opacity: number;
+}
+const ParticleCanvas: React.FC = () => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const particlesRef = useRef<Particle[]>([]);
+  const animFrameRef = useRef<number>(0);
+  const sizeRef = useRef({ width: 0, height: 0 });
+  const initParticles = useCallback((width: number, height: number) => {
+    const count = 80;
+    const particles: Particle[] = [];
+    for (let i = 0; i < count; i++) {
+      const colorBase = PARTICLE_COLORS[Math.floor(Math.random() * PARTICLE_COLORS.length)];
+      particles.push({
+        x: Math.random() * width,
+        y: Math.random() * height,
+        vx: (Math.random() - 0.5) * 0.4,
+        vy: -(Math.random() * 0.3 + 0.1),
+        radius: Math.random() * 2.5 + 2,
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 41 */
+        colorBase,
+        opacity: Math.random() * 0.4 + 0.3,
+      });
+    }
+    particlesRef.current = particles;
+  }, []);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const applySize = () => {
+      const parent = canvas.parentElement;
+      if (!parent) return;
+      const dpr = window.devicePixelRatio || 1;
+      const rect = parent.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      canvas.style.width = `${rect.width}px`;
+      canvas.style.height = `${rect.height}px`;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(dpr, dpr);
+      sizeRef.current = { width: rect.width, height: rect.height };
+      if (particlesRef.current.length === 0) {
+        initParticles(rect.width, rect.height);
+      }
+    };
+    applySize();
+    const resizeObserver = new ResizeObserver(() => {
+      applySize();
+    });
+    if (canvas.parentElement) {
+      resizeObserver.observe(canvas.parentElement);
+    }
+    const animate = () => {
+      const w = sizeRef.current.width;
+      const h = sizeRef.current.height;
+      if (w === 0 || h === 0) {
+        animFrameRef.current = requestAnimationFrame(animate);
+        return;
+      }
+      ctx.clearRect(0, 0, w, h);
+      const particles = particlesRef.current;
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        if (p.y < -10) {
+          p.y = h + 10;
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 42 */
+          p.x = Math.random() * w;
+        }
+        if (p.x < -10) p.x = w + 10;
+        if (p.x > w + 10) p.x = -10;
+      }
+      for (let i = 0; i < particles.length; i++) {
+        for (let j = i + 1; j < particles.length; j++) {
+          const dx = particles[i].x - particles[j].x;
+          const dy = particles[i].y - particles[j].y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < 150) {
+            const lineOpacity = 0.15 * (1 - dist / 150);
+            ctx.beginPath();
+            ctx.moveTo(particles[i].x, particles[i].y);
+            ctx.lineTo(particles[j].x, particles[j].y);
+            ctx.strokeStyle = `rgba(108,92,231,${lineOpacity})`;
+            ctx.lineWidth = 0.6;
+            ctx.stroke();
+          }
+        }
+      }
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.fillStyle = `${p.colorBase}${p.opacity})`;
+        ctx.fill();
+      }
+      animFrameRef.current = requestAnimationFrame(animate);
+    };
+    animFrameRef.current = requestAnimationFrame(animate);
+    return () => {
+      cancelAnimationFrame(animFrameRef.current);
+      resizeObserver.disconnect();
+    };
+  }, [initParticles]);
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{
+        position: 'absolute',
+        top: 0,
+        left: 0,
+        width: '100%',
+        height: '100%',
+        zIndex: 1,
+        pointerEvents: 'none',
+      }}
+    />
+  );
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 43 */
+};
+const ShieldIllustration: React.FC = () => (
+  <svg width="280" height="320" viewBox="0 0 280 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="shieldGrad" x1="140" y1="0" x2="140" y2="320" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#6C5CE7" stopOpacity="0.15" />
+        <stop offset="100%" stopColor="#6C5CE7" stopOpacity="0.02" />
+      </linearGradient>
+      <linearGradient id="shieldStroke" x1="140" y1="20" x2="140" y2="280" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#6C5CE7" stopOpacity="0.8" />
+        <stop offset="100%" stopColor="#6C5CE7" stopOpacity="0.3" />
+      </linearGradient>
+    </defs>
+    <path d="M140 30L50 75V165C50 230 85 280 140 300C195 280 230 230 230 165V75L140 30Z" fill="url(#shieldGrad)" stroke="url(#shieldStroke)" strokeWidth="2.5" />
+    <path d="M140 55L72 88V165C72 218 98 258 140 276C182 258 208 218 208 165V88L140 55Z" fill="rgba(108,92,231,0.04)" stroke="rgba(108,92,231,0.12)" strokeWidth="1" />
+    <path d="M112 160L132 180L172 140" stroke="#6C5CE7" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+    <circle cx="140" cy="30" r="5" fill="#6C5CE7" opacity="0.6" />
+    <circle cx="50" cy="75" r="5" fill="#6C5CE7" opacity="0.6" />
+    <circle cx="230" cy="75" r="5" fill="#6C5CE7" opacity="0.6" />
+    <line x1="140" y1="30" x2="140" y2="10" stroke="#6C5CE7" strokeWidth="1.5" opacity="0.4" />
+    <line x1="50" y1="75" x2="30" y2="65" stroke="#6C5CE7" strokeWidth="1.5" opacity="0.4" />
+    <line x1="230" y1="75" x2="250" y2="65" stroke="#6C5CE7" strokeWidth="1.5" opacity="0.4" />
+    <circle cx="140" cy="10" r="3" fill="#6C5CE7" opacity="0.3" />
+    <circle cx="30" cy="65" r="3" fill="#6C5CE7" opacity="0.3" />
+    <circle cx="250" cy="65" r="3" fill="#6C5CE7" opacity="0.3" />
+    <line x1="30" y1="65" x2="20" y2="90" stroke="#6C5CE7" strokeWidth="1" opacity="0.2" />
+    <line x1="250" y1="65" x2="260" y2="90" stroke="#6C5CE7" strokeWidth="1" opacity="0.2" />
+    <circle cx="20" cy="90" r="2" fill="#6C5CE7" opacity="0.2" />
+    <circle cx="260" cy="90" r="2" fill="#6C5CE7" opacity="0.2" />
+    <line x1="140" y1="10" x2="110" y2="18" stroke="#6C5CE7" strokeWidth="1" opacity="0.15" />
+    <line x1="140" y1="10" x2="170" y2="18" stroke="#6C5CE7" strokeWidth="1" opacity="0.15" />
+    <circle cx="110" cy="18" r="2" fill="#6C5CE7" opacity="0.15" />
+    <circle cx="170" cy="18" r="2" fill="#6C5CE7" opacity="0.15" />
+    <rect x="60" y="100" width="16" height="16" rx="3" fill="none" stroke="#6C5CE7" strokeWidth="1" opacity="0.15" transform="rotate(15 68 108)" />
+    <circle cx="220" cy="120" r="10" fill="none" stroke="#0090FF" strokeWidth="1" opacity="0.15" />
+    <polygon points="80,250 90,235 100,250" fill="none" stroke="#30A46C" strokeWidth="1" opacity="0.15" />
+    <rect x="195" y="230" width="12" height="12" rx="2" fill="none" stroke="#E5484D" strokeWidth="1" opacity="0.15" transform="rotate(-10 201 236)" />
+  </svg>
+);
+const FeatureIcon: React.FC<{ type: string; color: string }> = ({ type, color }) => {
+  const iconMap: Record<string, React.ReactNode> = {
+    shield: (
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+        <path d="M16 4L6 9V16C6 22.5 10 28 16 30C22 28 26 22.5 26 16V9L16 4Z" stroke={color} strokeWidth="2" fill={`${color}15`} />
+        <path d="M12 16L15 19L20 14" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+    graph: (
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+        <circle cx="16" cy="8" r="4" stroke={color} strokeWidth="2" fill={`${color}15`} />
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 44 */
+        <circle cx="8" cy="24" r="4" stroke={color} strokeWidth="2" fill={`${color}15`} />
+        <circle cx="24" cy="24" r="4" stroke={color} strokeWidth="2" fill={`${color}15`} />
+        <line x1="16" y1="12" x2="10" y2="20" stroke={color} strokeWidth="1.5" opacity="0.6" />
+        <line x1="16" y1="12" x2="22" y2="20" stroke={color} strokeWidth="1.5" opacity="0.6" />
+        <line x1="12" y1="24" x2="20" y2="24" stroke={color} strokeWidth="1.5" opacity="0.6" />
+      </svg>
+    ),
+    brain: (
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+        <circle cx="16" cy="16" r="12" stroke={color} strokeWidth="2" fill={`${color}15`} />
+        <path d="M10 16C10 12 13 10 16 10C19 10 22 12 22 16" stroke={color} strokeWidth="1.5" strokeLinecap="round" />
+        <path d="M12 20C12 17 14 16 16 16C18 16 20 17 20 20" stroke={color} strokeWidth="1.5" strokeLinecap="round" />
+        <circle cx="16" cy="14" r="2" fill={color} opacity="0.4" />
+      </svg>
+    ),
+    target: (
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+        <circle cx="16" cy="16" r="12" stroke={color} strokeWidth="2" fill={`${color}15`} />
+        <circle cx="16" cy="16" r="7" stroke={color} strokeWidth="1.5" fill="none" />
+        <circle cx="16" cy="16" r="3" fill={color} opacity="0.6" />
+        <line x1="16" y1="2" x2="16" y2="6" stroke={color} strokeWidth="1.5" />
+        <line x1="16" y1="26" x2="16" y2="30" stroke={color} strokeWidth="1.5" />
+        <line x1="2" y1="16" x2="6" y2="16" stroke={color} strokeWidth="1.5" />
+        <line x1="26" y1="16" x2="30" y2="16" stroke={color} strokeWidth="1.5" />
+      </svg>
+    ),
+  };
+  return <>{iconMap[type] || null}</>;
+};
+const Login: React.FC = () => {
+  const message = useAntdMessage();
+  const [username, setUsername] = useState(() => localStorage.getItem(REMEMBER_KEY) || '');
+  const [password, setPassword] = useState('');
+  const [rememberMe, setRememberMe] = useState(() => !!localStorage.getItem(REMEMBER_KEY));
+  const [loading, setLoading] = useState(false);
+  const navigate = useNavigate();
+  const handleLogin = async () => {
+    if (!username.trim() || !password.trim()) {
+      message.warning('请输入用户名和密码');
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await authApi.login(username, password);
+      tokenStorage.setToken(res.access_token);
+      tokenStorage.setUser(res.user);
+      if (rememberMe) {
+        localStorage.setItem(REMEMBER_KEY, username.trim());
+      } else {
+        localStorage.removeItem(REMEMBER_KEY);
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 45 */
+      }
+      if (res.must_change_password) {
+        message.warning('请修改默认密码后再继续使用');
+        navigate('/settings?tab=profile');
+      } else {
+        navigate('/');
+      }
+    } catch (e) {
+      message.error(getErrorMessage(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+  const handleForgotPassword = () => {
+    message.info('请联系系统管理员重置密码');
+  };
+  return (
+    <div style={{ minHeight: '100vh', display: 'flex', fontFamily: 'var(--font-body)' }}>
+      <style>{`
+        @import url('https://;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+        @keyframes loginFadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes loginFadeInUp { from { opacity: 0; transform: translateY(24px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes loginSlideLeft { from { opacity: 0; transform: translateX(-32px); } to { opacity: 1; transform: translateX(0); } }
+        @keyframes loginFloat1 { 0%, 100% { transform: translateY(0) rotate(0deg); } 50% { transform: translateY(-12px) rotate(3deg); } }
+        @keyframes loginFloat2 { 0%, 100% { transform: translateY(0) rotate(0deg); } 50% { transform: translateY(-8px) rotate(-2deg); } }
+        @keyframes loginPulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
+        @keyframes loginLineGrow { from { width: 0; } to { width: 56px; } }
+        @keyframes loginShieldFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+        @keyframes orbDrift1 { 0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.25; } 33% { transform: translate(30px, -20px) scale(1.1); opacity: 0.35; } 66% { transform: translate(-15px, 15px) scale(0.95); opacity: 0.2; } }
+        @keyframes orbDrift2 { 0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.2; } 33% { transform: translate(-25px, 20px) scale(1.08); opacity: 0.3; } 66% { transform: translate(20px, -10px) scale(0.92); opacity: 0.15; } }
+        @keyframes orbDrift3 { 0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.18; } 50% { transform: translate(15px, 25px) scale(1.12); opacity: 0.28; } }
+        @keyframes orbDrift4 { 0%, 100% { transform: translate(0, 0) scale(0.95); opacity: 0.2; } 40% { transform: translate(-20px, -15px) scale(1.05); opacity: 0.3; } 80% { transform: translate(10px, 10px) scale(1); opacity: 0.15; } }
+        .login-input .ant-input-affix-wrapper {
+          background: #FFFFFF !important;
+          border: 2px solid rgba(0,0,0,0.06) !important;
+          border-radius: 14px !important;
+          height: 50px !important;
+          font-size: 15px !important;
+          font-family: var(--font-body) !important;
+          color: var(--text-0) !important;
+          transition: all 0.25s ease !important;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.03) !important;
+          padding: 0 16px !important;
+        }
+        .login-input .ant-input-affix-wrapper:hover {
+          border-color: rgba(108,92,231,0.3) !important;
+          box-shadow: 0 4px 16px rgba(108,92,231,0.08) !important;
+        }
+        .login-input .ant-input-affix-wrapper-focused,
+        .login-input .ant-input-affix-wrapper:focus-within {
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 46 */
+          border-color: #6C5CE7 !important;
+          box-shadow: 0 0 0 4px rgba(108,92,231,0.1), 0 4px 16px rgba(108,92,231,0.08) !important;
+        }
+        .login-input .ant-input {
+          background: transparent !important;
+          border: none !important;
+          font-size: 15px !important;
+          font-family: var(--font-body) !important;
+          color: var(--text-0) !important;
+        }
+        .login-input .ant-input::placeholder { color: var(--text-3) !important; }
+        .login-input .ant-input-prefix { color: var(--text-3) !important; margin-right: 12px !important; }
+        .login-input .ant-input-suffix .anticon { color: var(--text-3) !important; }
+        .login-btn {
+          background: #6C5CE7 !important;
+          border: none !important;
+          color: #FFFFFF !important;
+          font-family: var(--font-body) !important;
+          font-size: 16px !important;
+          font-weight: 700 !important;
+          border-radius: 14px !important;
+          height: 52px !important;
+          transition: all 0.3s cubic-bezier(0.22, 1, 0.36, 1) !important;
+          box-shadow: 0 6px 24px rgba(108,92,231,0.35) !important;
+          letter-spacing: 0.02em !important;
+        }
+        .login-btn:hover {
+          background: #5A4BD6 !important;
+          transform: translateY(-2px) !important;
+          box-shadow: 0 8px 32px rgba(108,92,231,0.45) !important;
+        }
+        .login-btn:active {
+          background: #4F3FC9 !important;
+          transform: translateY(0) !important;
+        }
+      `}</style>
+      <div style={{
+        width: '58%',
+        background: 'linear-gradient(135deg, #F8F7FF 0%, #FFFFFF 40%, #F5F3FF 100%)',
+        display: 'flex',
+        flexDirection: 'column',
+        position: 'relative',
+        overflow: 'hidden',
+      }}>
+        <ParticleCanvas />
+        <div style={{
+          position: 'absolute',
+          top: -60,
+          right: -40,
+          width: 360,
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 47 */
+          height: 360,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(108,92,231,0.25) 0%, rgba(108,92,231,0.1) 40%, transparent 70%)',
+          pointerEvents: 'none',
+          zIndex: 2,
+          animation: 'orbDrift1 12s ease-in-out infinite',
+        }} />
+        <div style={{
+          position: 'absolute',
+          bottom: -40,
+          left: -50,
+          width: 320,
+          height: 320,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(0,144,255,0.2) 0%, rgba(0,144,255,0.06) 40%, transparent 70%)',
+          pointerEvents: 'none',
+          zIndex: 2,
+          animation: 'orbDrift2 15s ease-in-out infinite',
+        }} />
+        <div style={{
+          position: 'absolute',
+          top: '40%',
+          left: '50%',
+          width: 280,
+          height: 280,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(48,164,108,0.18) 0%, rgba(48,164,108,0.04) 40%, transparent 70%)',
+          pointerEvents: 'none',
+          zIndex: 2,
+          animation: 'orbDrift3 18s ease-in-out infinite',
+        }} />
+        <div style={{
+          position: 'absolute',
+          top: '15%',
+          left: '10%',
+          width: 240,
+          height: 240,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(108,92,231,0.2) 0%, rgba(90,75,214,0.05) 40%, transparent 70%)',
+          pointerEvents: 'none',
+          zIndex: 2,
+          animation: 'orbDrift4 14s ease-in-out infinite',
+        }} />
+        <div style={{
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: 'center',
+          padding: '60px 64px',
+          position: 'relative',
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 48 */
+          zIndex: 3,
+        }}>
+          <div style={{ animation: 'loginSlideLeft 0.7s cubic-bezier(0.22, 1, 0.36, 1) both' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 20, marginBottom: 36 }}>
+              <div style={{ animation: 'loginShieldFloat 4s ease-in-out infinite' }}>
+                <ShieldIllustration />
+              </div>
+              <div>
+                <span style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 14,
+                  fontWeight: 500,
+                  color: '#6C5CE7',
+                  letterSpacing: '0.06em',
+                  display: 'block',
+                  marginBottom: 12,
+                }}>
+                  /ThreatIntel
+                </span>
+                <h1 style={{
+                  fontFamily: 'var(--font-display)',
+                  fontSize: 48,
+                  fontWeight: 700,
+                  color: 'var(--text-0)',
+                  lineHeight: 1.15,
+                  margin: 0,
+                  letterSpacing: '-0.02em',
+                }}>
+                  黑灰产情报
+                  <br />
+                  分析平台
+                </h1>
+                <div style={{
+                  width: 56,
+                  height: 4,
+                  background: '#6C5CE7',
+                  borderRadius: 2,
+                  marginTop: 20,
+                  animation: 'loginLineGrow 0.8s cubic-bezier(0.22, 1, 0.36, 1) both',
+                  animationDelay: '0.3s',
+                }} />
+              </div>
+            </div>
+          </div>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr 1fr',
+            gap: 16,
+            animation: 'loginFadeInUp 0.6s cubic-bezier(0.22, 1, 0.36, 1) both',
+            animationDelay: '0.3s',
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 49 */
+          }}>
+            {FEATURES.map((f, i) => (
+              <div
+                key={f.title}
+                style={{
+                  background: 'rgba(255,255,255,0.82)',
+                  backdropFilter: 'blur(8px)',
+                  WebkitBackdropFilter: 'blur(8px)',
+                  borderRadius: 16,
+                  padding: '20px 18px',
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 14,
+                  border: `1px solid ${f.color}18`,
+                  boxShadow: `0 2px 12px ${f.color}08`,
+                  transition: 'all 0.3s cubic-bezier(0.22, 1, 0.36, 1)',
+                  cursor: 'default',
+                  position: 'relative',
+                  overflow: 'hidden',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.transform = 'translateY(-3px)';
+                  e.currentTarget.style.boxShadow = `0 8px 24px ${f.color}15`;
+                  e.currentTarget.style.borderColor = `${f.color}30`;
+                  e.currentTarget.style.background = 'rgba(255,255,255,0.92)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.transform = 'translateY(0)';
+                  e.currentTarget.style.boxShadow = `0 2px 12px ${f.color}08`;
+                  e.currentTarget.style.borderColor = `${f.color}18`;
+                  e.currentTarget.style.background = 'rgba(255,255,255,0.82)';
+                }}
+              >
+                <div style={{
+                  width: 48,
+                  height: 48,
+                  borderRadius: 14,
+                  background: `${f.color}12`,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                  border: `1px solid ${f.color}20`,
+                }}>
+                  <FeatureIcon type={f.icon} color={f.color} />
+                </div>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{
+                    fontFamily: 'var(--font-display)',
+                    fontSize: 16,
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 50 */
+                    fontWeight: 700,
+                    color: 'var(--text-0)',
+                    marginBottom: 4,
+                    lineHeight: 1.3,
+                  }}>{f.title}</div>
+                  <div style={{
+                    fontFamily: 'var(--font-body)',
+                    fontSize: 13,
+                    color: 'var(--text-2)',
+                    lineHeight: 1.5,
+                  }}>{f.desc}</div>
+                </div>
+                <div style={{
+                  position: 'absolute',
+                  top: -8,
+                  right: -8,
+                  width: 40,
+                  height: 40,
+                  borderRadius: '50%',
+                  background: `${f.color}08`,
+                  pointerEvents: 'none',
+                }} />
+              </div>
+            ))}
+          </div>
+        </div>
+        <div style={{
+          padding: '24px 64px 32px',
+          position: 'relative',
+          zIndex: 3,
+          borderTop: '1px solid rgba(0,0,0,0.06)',
+          background: 'rgba(255,255,255,0.6)',
+          backdropFilter: 'blur(6px)',
+          WebkitBackdropFilter: 'blur(6px)',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-end',
+        }}>
+          <div style={{ display: 'flex', gap: 36 }}>
+            {[
+              { value: '1228+', label: '情报条目' },
+              { value: '217', label: '实体节点' },
+              { value: '761', label: '关联边' },
+            ].map((s, i) => (
+              <div key={s.label} style={{ animation: `loginFadeInUp 0.5s cubic-bezier(0.22, 1, 0.36, 1) both`, animationDelay: `${0.6 + i * 0.1}s` }}>
+                <div style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 28,
+                  fontWeight: 700,
+                  color: '#6C5CE7',
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 51 */
+                  lineHeight: 1.2,
+                }}>{s.value}</div>
+                <div style={{
+                  fontFamily: 'var(--font-body)',
+                  fontSize: 12,
+                  color: 'var(--text-3)',
+                  marginTop: 2,
+                }}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{
+            fontFamily: 'var(--font-mono)',
+            fontSize: 11,
+            color: 'var(--text-3)',
+            letterSpacing: '0.05em',
+          }}>
+            © 2026 ThreatIntel
+          </div>
+        </div>
+      </div>
+      <div style={{
+        width: '42%',
+        background: 'linear-gradient(180deg, #F8F7FF 0%, #FFFFFF 40%, #FFFFFF 100%)',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '80px 40px 60px',
+        animation: 'loginFadeIn 0.6s cubic-bezier(0.22, 1, 0.36, 1) both',
+        animationDelay: '0.15s',
+        position: 'relative',
+        borderLeft: '1px solid rgba(108,92,231,0.08)',
+      }}>
+        <svg style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none', opacity: 0.5 }} xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <pattern id="loginDots2" x="0" y="0" width="32" height="32" patternUnits="userSpaceOnUse">
+              <circle cx="16" cy="16" r="0.8" fill="rgba(108,92,231,0.1)" />
+            </pattern>
+          </defs>
+          <rect width="100%" height="100%" fill="url(#loginDots2)" />
+        </svg>
+        <div style={{
+          position: 'absolute',
+          top: '15%',
+          right: '10%',
+          width: 120,
+          height: 120,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(108,92,231,0.06) 0%, transparent 70%)',
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 52 */
+          pointerEvents: 'none',
+        }} />
+        <div style={{ width: '100%', maxWidth: 380, position: 'relative', zIndex: 1 }}>
+          <div style={{
+            width: 56,
+            height: 56,
+            borderRadius: 16,
+            background: 'rgba(108,92,231,0.1)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            marginBottom: 32,
+            border: '1px solid rgba(108,92,231,0.15)',
+          }}>
+            <svg width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M14 2L4 7V14C4 20.5 8 25.5 14 27C20 25.5 24 20.5 24 14V7L14 2Z" stroke="#6C5CE7" strokeWidth="2" fill="rgba(108,92,231,0.08)" />
+              <path d="M10 14L13 17L18 12" stroke="#6C5CE7" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </div>
+          <div style={{
+            fontFamily: 'var(--font-display)',
+            fontSize: 36,
+            fontWeight: 700,
+            color: 'var(--text-0)',
+            lineHeight: 1.2,
+            marginBottom: 8,
+            letterSpacing: '-0.02em',
+          }}>
+            欢迎回来
+          </div>
+          <div style={{
+            width: 40,
+            height: 3,
+            background: '#6C5CE7',
+            borderRadius: 2,
+            marginBottom: 12,
+            animation: 'loginLineGrow 0.8s cubic-bezier(0.22, 1, 0.36, 1) both',
+            animationDelay: '0.4s',
+          }} />
+          <div style={{
+            fontFamily: 'var(--font-body)',
+            fontSize: 15,
+            color: 'var(--text-2)',
+            marginBottom: 40,
+          }}>
+            登录以访问威胁情报分析平台
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            <div>
+              <label style={{
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 53 */
+                display: 'block',
+                fontFamily: 'var(--font-mono)',
+                fontSize: 12,
+                textTransform: 'uppercase',
+                letterSpacing: '0.1em',
+                color: 'var(--text-2)',
+                marginBottom: 8,
+                fontWeight: 600,
+              }}>
+                用户名
+              </label>
+              <div className="login-input">
+                <Input
+                  prefix={<UserOutlined style={{ fontSize: 16 }} />}
+                  placeholder="请输入用户名"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  onPressEnter={handleLogin}
+                  autoFocus
+                />
+              </div>
+            </div>
+            <div>
+              <label style={{
+                display: 'block',
+                fontFamily: 'var(--font-mono)',
+                fontSize: 12,
+                textTransform: 'uppercase',
+                letterSpacing: '0.1em',
+                color: 'var(--text-2)',
+                marginBottom: 8,
+                fontWeight: 600,
+              }}>
+                密码
+              </label>
+              <div className="login-input">
+                <Input.Password
+                  prefix={<LockOutlined style={{ fontSize: 16 }} />}
+                  placeholder="请输入密码"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  onPressEnter={handleLogin}
+                />
+              </div>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <label style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 54 */
+                fontSize: 14,
+                color: 'var(--text-2)',
+                cursor: 'pointer',
+                userSelect: 'none',
+                fontFamily: 'var(--font-body)',
+              }}>
+                <input
+                  type="checkbox"
+                  checked={rememberMe}
+                  onChange={e => setRememberMe(e.target.checked)}
+                  style={{ accentColor: '#6C5CE7', width: 16, height: 16, cursor: 'pointer' }}
+                />
+                记住我
+              </label>
+              <span
+                style={{
+                  fontSize: 14,
+                  color: 'var(--text-3)',
+                  cursor: 'pointer',
+                  fontFamily: 'var(--font-body)',
+                  transition: 'color 0.2s ease',
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = '#6C5CE7'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-3)'; }}
+                onClick={handleForgotPassword}
+              >
+                忘记密码？
+              </span>
+            </div>
+            <Button
+              type="primary"
+              block
+              loading={loading}
+              onClick={handleLogin}
+              className="login-btn"
+            >
+              登录系统
+            </Button>
+          </div>
+          <div style={{
+            marginTop: 32,
+            padding: '14px 20px',
+            background: 'rgba(108,92,231,0.06)',
+            borderRadius: 14,
+            border: '1px solid rgba(108,92,231,0.1)',
+            textAlign: 'center',
+            fontFamily: 'var(--font-mono)',
+            fontSize: 13,
+            color: '#6C5CE7',
+            letterSpacing: '0.03em',
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 55 */
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 8,
+          }}>
+            <SafetyOutlined style={{ fontSize: 15 }} />
+            演示账号 / admin · Admin@2024
+          </div>
+          <div style={{
+            marginTop: 40,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 10,
+          }}>
+            <span style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              background: '#30A46C',
+              display: 'inline-block',
+              animation: 'loginPulse 2s ease-in-out infinite',
+            }} />
+            <span style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 12,
+              color: 'var(--text-3)',
+              letterSpacing: '0.05em',
+            }}>
+              安全连接 · SSL/TLS 加密
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+export default Login;
+// ============================================================
+// File: pages/DeploymentManage.tsx
+// ============================================================
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  Tabs, Card, Statistic, Tag, Spin, Empty, Space, Button, Table, Descriptions,
+} from 'antd';
+import {
+  HeartOutlined, CloudServerOutlined, CloudOutlined, ContainerOutlined,
+  HistoryOutlined, DashboardOutlined, ReloadOutlined,
+} from '@ant-design/icons';
+import {
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 56 */
+  LineChart, Line, XAxis, YAxis, Tooltip as RTooltip,
+  ResponsiveContainer, CartesianGrid,
+} from 'recharts';
+import { api, getErrorMessage } from '../services/api';
+import { useAntdMessage } from '../utils/hooks';
+const renderConfigValue = (val: unknown): React.ReactNode => {
+  if (val === null || val === undefined) return '—';
+  if (typeof val === 'string' || typeof val === 'number') return String(val);
+  if (typeof val === 'boolean') return val ? '是' : '否';
+  if (typeof val === 'object') {
+    const obj = val as Record<string, unknown>;
+    if ('status' in obj) {
+      const parts = [String(obj.status)];
+      if ('type' in obj) parts.push(String(obj.type));
+      if ('host' in obj) parts.push(String(obj.host));
+      if ('port' in obj) parts.push(String(obj.port));
+      return parts.join(' · ');
+    }
+    if ('host' in obj && 'port' in obj) return `${obj.host}:${obj.port}`;
+    return <span style={{ fontSize: 12 }}>{JSON.stringify(val, null, 2)}</span>;
+  }
+  return String(val);
+};
+const DeploymentManage: React.FC = () => {
+  const message = useAntdMessage();
+  const [health, setHealth] = useState<Record<string, unknown> | null>(null);
+  const [services, setServices] = useState<Record<string, unknown>[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [metrics, setMetrics] = useState<Record<string, unknown>[]>([]);
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState('overview');
+  const fetchHealth = async () => {
+    setLoading(true);
+    try {
+      const [healthRes, detailRes] = await Promise.allSettled([
+        api.deployment.health(),
+        api.deployment.detailedHealth(),
+      ]);
+      if (healthRes.status === 'fulfilled') setHealth(healthRes.value as Record<string, unknown>);
+      if (detailRes.status === 'fulfilled') {
+        const d = detailRes.value as Record<string, unknown>;
+        const raw = d?.services || d?.items || d?.data || [];
+        setServices(Array.isArray(raw) ? raw as Record<string, unknown>[] : []);
+      }
+    } catch {} finally { setLoading(false); }
+  };
+  const fetchMetrics = async () => {
+    setMetricsLoading(true);
+    try {
+      const res = await api.deployment.getMetricsHistory();
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 57 */
+      const d = res as Record<string, unknown>;
+      const rawM = d?.metrics || d?.items || d?.data || [];
+      setMetrics(Array.isArray(rawM) ? rawM as Record<string, unknown>[] : []);
+    } catch { setMetrics([]); } finally { setMetricsLoading(false); }
+  };
+  useEffect(() => { fetchHealth(); }, []);
+  const isHealthy = health?.status === 'healthy' || health?.status === 'ok' || health?.status === 'UP';
+  const metricsChartData = useMemo(() => metrics.map((m, i) => ({
+    time: String(m.timestamp || m.time || m.created_at || `T+${i}`).slice(11, 16),
+    cpu: Number(m.cpu_usage || m.cpu || 0),
+    memory: Number(m.memory_usage || m.memory || 0),
+    disk: Number(m.disk_usage || m.disk || 0),
+    network: Number(m.network_usage || m.network || 0),
+  })), [metrics]);
+  const latestMetrics = useMemo(() => {
+    if (metricsChartData.length === 0) return { cpu: 0, memory: 0, disk: 0, network: 0 };
+    return metricsChartData[metricsChartData.length - 1];
+  }, [metricsChartData]);
+  const serviceColumns = [
+    { title: '服务名', dataIndex: 'name', key: 'name', render: (text: string) => <span style={{ color: 'var(--text-0)', fontWeight: 500 }}>{text || '—'}</span> },
+    { title: '状态', dataIndex: 'status', key: 'status', width: 90, render: (status: string) => { const ok = status === 'healthy' || status === 'ok' || status === 'UP' || status === 'running'; return <Tag style={{ background: ok ? 'var(--green-dim)' : 'var(--red-dim)', color: ok ? 'var(--green)' : 'var(--red)', border: 'none' }}>{ok ? '正常' : '异常'}</Tag>; } },
+    { title: '端口', dataIndex: 'port', key: 'port', width: 80, render: (text: unknown) => <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)', fontSize: 12 }}>{String(text || '—')}</span> },
+    { title: '版本', dataIndex: 'version', key: 'version', width: 100, render: (text: string) => <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-3)', fontSize: 12 }}>{text || '—'}</span> },
+    { title: '运行时间', dataIndex: 'uptime', key: 'uptime', width: 120, render: (text: string) => <span style={{ fontSize: 12, color: 'var(--text-2)' }}>{text || '—'}</span> },
+  ];
+  const tooltipStyle: React.CSSProperties = { background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', fontSize: 12, color: 'var(--text-0)' };
+  const tabItems = [
+    {
+      key: 'overview',
+      label: <span><CloudServerOutlined style={{ marginRight: 4 }} />环境配置</span>,
+      children: (
+        <div>
+          <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 16, padding: '12px 16px', background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+            管理系统部署环境的配置信息，包括环境变量、服务端口和依赖版本
+          </div>
+          {health ? (
+            <Descriptions bordered column={2} size="small" styles={{ label: { background: 'var(--bg-2)', color: 'var(--text-2)', fontWeight: 500, fontSize: 12 }, content: { fontSize: 13, color: 'var(--text-0)' } }}>
+              <Descriptions.Item label="环境">{String(health.environment || health.env || '—')}</Descriptions.Item>
+              <Descriptions.Item label="版本">{String(health.version || '—')}</Descriptions.Item>
+              <Descriptions.Item label="API 地址">{String(health.api_url || health.api_endpoint || '—')}</Descriptions.Item>
+              <Descriptions.Item label="数据库">{renderConfigValue(health.database || health.db_status)}</Descriptions.Item>
+              <Descriptions.Item label="Redis">{renderConfigValue(health.redis || health.redis_status)}</Descriptions.Item>
+              <Descriptions.Item label="最后部署">{String(health.last_deploy || health.deployed_at || '—')}</Descriptions.Item>
+            </Descriptions>
+          ) : (
+            <Empty description={<span style={{ color: 'var(--text-3)' }}>无法获取环境配置信息</span>} />
+          )}
+        </div>
+      ),
+    },
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 58 */
+    {
+      key: 'docker',
+      label: <span><ContainerOutlined style={{ marginRight: 4 }} />Docker</span>,
+      children: (
+        <div>
+          <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 16, padding: '12px 16px', background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+            查看 Docker 容器运行状态，管理容器生命周期
+          </div>
+          {services.length > 0 ? (
+            <Table dataSource={services} columns={serviceColumns} rowKey={(record) => String(record.name || record.id || Math.random())} pagination={false} size="small" />
+          ) : (
+            <Empty description={<span style={{ color: 'var(--text-3)' }}>暂无容器信息</span>} />
+          )}
+        </div>
+      ),
+    },
+    {
+      key: 'huawei',
+      label: <span><CloudOutlined style={{ marginRight: 4 }} />华为云</span>,
+      children: (
+        <div>
+          <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 16, padding: '12px 16px', background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+            管理华为云 ECS、OBS、RDS 等云服务配置
+          </div>
+          {health?.huawei_cloud || health?.cloud ? (
+            <Descriptions bordered column={2} size="small" styles={{ label: { background: 'var(--bg-2)', color: 'var(--text-2)', fontWeight: 500, fontSize: 12 }, content: { fontSize: 13, color: 'var(--text-0)' } }}>
+              <Descriptions.Item label="区域">{String((health?.huawei_cloud as Record<string, unknown>)?.region || (health?.cloud as Record<string, unknown>)?.region || '—')}</Descriptions.Item>
+              <Descriptions.Item label="ECS 实例">{String((health?.huawei_cloud as Record<string, unknown>)?.ecs_instance || (health?.cloud as Record<string, unknown>)?.ecs || '—')}</Descriptions.Item>
+              <Descriptions.Item label="OBS 桶">{String((health?.huawei_cloud as Record<string, unknown>)?.obs_bucket || (health?.cloud as Record<string, unknown>)?.obs || '—')}</Descriptions.Item>
+              <Descriptions.Item label="RDS 实例">{String((health?.huawei_cloud as Record<string, unknown>)?.rds_instance || (health?.cloud as Record<string, unknown>)?.rds || '—')}</Descriptions.Item>
+            </Descriptions>
+          ) : (
+            <Empty description={<span style={{ color: 'var(--text-3)' }}>暂无华为云配置信息</span>} />
+          )}
+        </div>
+      ),
+    },
+    {
+      key: 'deploy',
+      label: <span><HistoryOutlined style={{ marginRight: 4 }} />部署记录</span>,
+      children: (
+        <div>
+          <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 16, padding: '12px 16px', background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+            查看系统部署历史记录和回滚操作
+          </div>
+          <Empty description={<span style={{ color: 'var(--text-3)' }}>暂无部署记录</span>} />
+        </div>
+      ),
+    },
+    {
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 59 */
+      key: 'monitor',
+      label: <span><DashboardOutlined style={{ marginRight: 4 }} />监控</span>,
+      children: (
+        <div>
+          <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 16, padding: '12px 16px', background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+            实时监控系统资源使用情况，包括 CPU、内存、磁盘和网络
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 16 }}>
+            <Button icon={<ReloadOutlined />} onClick={fetchMetrics} loading={metricsLoading}>刷新指标</Button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }}>
+            <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20, textAlign: 'center' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-2)', fontWeight: 500, marginBottom: 8 }}>CPU 使用率</div>
+              <Statistic value={latestMetrics.cpu} suffix="%" valueStyle={{ fontFamily: 'var(--font-mono)', color: latestMetrics.cpu > 80 ? 'var(--red)' : 'var(--blue)', fontWeight: 700 }} />
+            </div>
+            <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20, textAlign: 'center' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-2)', fontWeight: 500, marginBottom: 8 }}>内存使用率</div>
+              <Statistic value={latestMetrics.memory} suffix="%" valueStyle={{ fontFamily: 'var(--font-mono)', color: latestMetrics.memory > 80 ? 'var(--red)' : 'var(--green)', fontWeight: 700 }} />
+            </div>
+            <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20, textAlign: 'center' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-2)', fontWeight: 500, marginBottom: 8 }}>磁盘使用率</div>
+              <Statistic value={latestMetrics.disk} suffix="%" valueStyle={{ fontFamily: 'var(--font-mono)', color: latestMetrics.disk > 80 ? 'var(--red)' : 'var(--orange)', fontWeight: 700 }} />
+            </div>
+            <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20, textAlign: 'center' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-2)', fontWeight: 500, marginBottom: 8 }}>网络流量</div>
+              <Statistic value={latestMetrics.network} suffix=" MB/s" valueStyle={{ fontFamily: 'var(--font-mono)', color: 'var(--teal)', fontWeight: 700 }} />
+            </div>
+          </div>
+          {metricsChartData.length > 0 ? (
+            <div className="chart-reveal chart-d-1" style={{ background: 'var(--bg-1)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border)', padding: '16px 12px 8px' }}>
+              <ResponsiveContainer width="100%" height={320}>
+                <LineChart data={metricsChartData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                  <XAxis dataKey="time" tick={{ fill: 'var(--text-3)', fontSize: 11 }} axisLine={{ stroke: 'var(--border)' }} tickLine={false} />
+                  <YAxis tick={{ fill: 'var(--text-3)', fontSize: 11 }} axisLine={false} tickLine={false} width={45} />
+                  <RTooltip contentStyle={tooltipStyle} />
+                  <Line type="monotone" dataKey="cpu" stroke="#2563EB" strokeWidth={1.5} dot={false} name="CPU" isAnimationActive={true} animationBegin={600} animationDuration={1200} animationEasing="ease-out" />
+                  <Line type="monotone" dataKey="memory" stroke="#16A34A" strokeWidth={1.5} dot={false} name="内存" isAnimationActive={true} animationBegin={600} animationDuration={1200} animationEasing="ease-out" />
+                  <Line type="monotone" dataKey="disk" stroke="#EA580C" strokeWidth={1.5} dot={false} name="磁盘" isAnimationActive={true} animationBegin={600} animationDuration={1200} animationEasing="ease-out" />
+                  <Line type="monotone" dataKey="network" stroke="#0D9488" strokeWidth={1.5} dot={false} name="网络" isAnimationActive={true} animationBegin={600} animationDuration={1200} animationEasing="ease-out" />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <div style={{ height: 320, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-1)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border)' }}>
+              <span style={{ color: 'var(--text-3)', fontSize: 13 }}>点击「刷新指标」获取监控数据</span>
+            </div>
+          )}
+        </div>
+      ),
+/* 黑灰产情报系统安全认证与访问控制平台 V1.0 */
+/* Page 60 */
+    },
+  ];
+  return (
+    <div style={{ padding: 32, background: 'var(--bg-0)', minHeight: '100vh', overflowX: 'hidden' }}>
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontSize: 28, fontWeight: 700, fontFamily: 'var(--font-body)', color: 'var(--text-0)', margin: 0, letterSpacing: '-0.02em' }}>部署管理</h1>
+        <p style={{ fontSize: 14, color: 'var(--text-2)', margin: '8px 0 0', fontFamily: 'var(--font-body)' }}>管理系统部署环境、Docker容器和云服务配置</p>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 24, marginBottom: 24 }}>
+        <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 24, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+          {loading ? <Spin /> : (
+            <>
+              <HeartOutlined style={{ fontSize: 48, color: isHealthy ? 'var(--green)' : 'var(--red)', marginBottom: 16 }} />
+              <div style={{ fontSize: 20, fontWeight: 600, color: isHealthy ? 'var(--green)' : 'var(--red)', marginBottom: 8 }}>
+                {isHealthy ? '系统正常' : '系统异常'}
+              </div>
+              <Tag style={{ background: isHealthy ? 'var(--green-dim)' : 'var(--red-dim)', color: isHealthy ? 'var(--green)' : 'var(--red)', border: 'none', fontSize: 13, padding: '4px 12px' }}>
+                {String(health?.status || 'unknown').toUpperCase()}
+              </Tag>
+              <Button icon={<ReloadOutlined />} onClick={fetchHealth} style={{ marginTop: 16 }} size="small">刷新</Button>
+            </>
+          )}
+        </div>
+        <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 24 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-0)', marginBottom: 16 }}>服务状态</div>
+          {loading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}><Spin /></div> : services.length === 0 ? <Empty description={<span style={{ color: 'var(--text-3)' }}>暂无服务状态信息</span>} /> : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+              {services.map((s, i) => {
+                const ok = String(s.status) === 'healthy' || String(s.status) === 'ok' || String(s.status) === 'UP' || String(s.status) === 'running';
+                return (
+                  <div key={i} style={{ padding: 16, background: 'var(--bg-2)', borderRadius: 'var(--radius)', border: `1px solid ${ok ? 'var(--border)' : 'var(--red)'}` }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                      <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-0)' }}>{String(s.name || '—')}</span>
+                      <Tag style={{ background: ok ? 'var(--green-dim)' : 'var(--red-dim)', color: ok ? 'var(--green)' : 'var(--red)', border: 'none' }}>{ok ? '正常' : '异常'}</Tag>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>端口: {String(s.port || '—')}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+      <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 24 }}>
+        <Tabs activeKey={activeTab} onChange={setActiveTab} items={tabItems} />
+      </div>
+    </div>
+  );
+};
+export default DeploymentManage;

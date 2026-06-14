@@ -1,0 +1,111 @@
+:root {
+  --bg-0: #0B0D17;
+  --bg-1: #141625;
+  --bg-2: #1C1F35;
+  --bg-3: rgba(255,255,255,0.06);
+  --bg-4: rgba(255,255,255,0.10);
+
+  --text-0: #E8E9ED;
+  --text-1: #C8C9D0;
+  --text-2: #7C7F9A;
+  --text-3: #4A4D68;
+
+  --accent: #6C5CE7;
+  --accent-hover: #5A4BD6;
+  --accent-light: rgba(108, 92, 231, 0.15);
+  --accent-dim: rgba(108, 92, 231, 0.12);
+  --accent-soft: rgba(108, 92, 231, 0.18);
+  --accent-medium: rgba(108, 92, 231, 0.28);
+
+  --accent2: #818CF8;
+  --accent2-dim: rgba(129, 140, 248, 0.12);
+  --accent2-soft: rgba(129, 140, 248, 0.18);
+
+  --red: #EF4444;
+  --red-dim: rgba(239, 68, 68, 0.12);
+  --red-soft: rgba(239, 68, 68, 0.18);
+  --orange: #F97316;
+  --orange-dim: rgba(249, 115, 22, 0.12);
+  --yellow: #EAB308;
+  --yellow-dim: rgba(234, 179, 8, 0.12);
+  --green: #22C55E;
+  --green-dim: rgba(34, 197, 94, 0.12);
+  --green-soft: rgba(34, 197, 94, 0.18);
+  --blue: #3B82F6;
+  --blue-dim: rgba(59, 130, 246, 0.12);
+  --purple: #6C5CE7;
+  --purple-dim: rgba(108, 92, 231, 0.12);
+  --purple-soft: rgba(108, 92, 231, 0.18);
+  --teal: #14B8A6;
+  --teal-dim: rgba(20, 184, 166, 0.12);
+  --cyan: #06B6D4;
+  --cyan-dim: rgba(6, 182, 212, 0.12);
+
+  --border: rgba(255,255,255,0.06);
+  --border-light: rgba(255,255,255,0.04);
+  --border-hover: rgba(108, 92, 231, 0.35);
+  --border-accent: rgba(108, 92, 231, 0.45);
+
+  --glass-bg: rgba(20, 22, 37, 0.80);
+  --glass-border: rgba(108, 92, 231, 0.10);
+  --glass-highlight: rgba(255, 255, 255, 0.06);
+
+  --radius: 12px;
+  --radius-lg: 16px;
+  --radius-sm: 8px;
+  --radius-xl: 24px;
+  --radius-xs: 6px;
+
+  --shadow-xs: 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-sm: 0 2px 8px rgba(0,0,0,0.06);
+  --shadow-card: 0 4px 16px rgba(0,0,0,0.06);
+  --shadow-md: 0 8px 32px rgba(0,0,0,0.08);
+  --shadow-elevated: 0 16px 48px rgba(0,0,0,0.10);
+  --shadow-glow: 0 0 20px rgba(108, 92, 231, 0.10);
+  --shadow-glow-accent: 0 4px 16px rgba(108, 92, 231, 0.15);
+
+  --font-display: "Space Grotesk", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-body: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", monospace;
+  --font-number: "Space Grotesk", "JetBrains Mono", monospace;
+
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-base: 14px;
+  --font-size-md: 16px;
+  --font-size-lg: 18px;
+  --font-size-xl: 24px;
+  --font-size-2xl: 32px;
+  --font-size-3xl: 48px;
+
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 12px;
+  --spacing-lg: 16px;
+  --spacing-xl: 24px;
+  --spacing-2xl: 32px;
+  --spacing-3xl: 48px;
+
+  --z-index-dropdown: 1000;
+  --z-index-sticky: 1020;
+  --z-index-fixed: 1030;
+  --z-index-modal-backdrop: 1040;
+  --z-index-modal: 1050;
+  --z-index-popover: 1060;
+  --z-index-tooltip: 1070;
+
+  --sidebar-w: 260px;
+  --header-h: 56px;
+  --grid-columns: 12;
+  --grid-gap: 1.5rem;
+  --base-unit: 10px;
+
+  --transition-fast: 0.15s ease;
+  --transition-normal: 0.25s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  --transition-spring: 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

@@ -1,0 +1,3123 @@
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 1 */
+# ============================================================
+# File: api/smartqa.py
+# ============================================================
+import json
+import uuid
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.auth import User, get_current_user
+from app.core.db_utils import db_write
+from app.core.qa_engine import RAGEngine, DialogueManager, CitationTracker
+from app.core.validators import validate_domain_object
+from app.db.database import get_db
+from app.db.tables import QAConversationTable
+router = APIRouter(prefix="/smartqa", tags=["智能问答"])
+class ConversationCreate(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    title: str = Field(..., min_length=1, max_length=256)
+    industry: Optional[str] = None
+    rag_enabled: bool = True
+    model_id: Optional[str] = None
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    rag_enabled: Optional[bool] = None
+class SwitchIndustryRequest(BaseModel):
+    industry: str = Field(..., min_length=1)
+def _row_to_dict(row: QAConversationTable) -> Dict:
+    messages = []
+    try:
+        messages = json.loads(row.messages_json) if row.messages_json else []
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    return {
+        "id": row.id,
+        "title": row.title,
+        "messages": messages,
+        "industry": row.industry,
+        "rag_enabled": row.rag_enabled,
+        "model_id": row.model_id,
+        "conversation_type": getattr(row, "conversation_type", None),
+        "is_active": getattr(row, "is_active", True),
+        "description": getattr(row, "description", None),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "created_by": row.created_by,
+    }
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 2 */
+@router.get("/conversations")
+async def list_conversations(
+    industry: Optional[str] = None,
+    conversation_type: Optional[str] = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(QAConversationTable)
+    count_stmt = select(func.count()).select_from(QAConversationTable)
+    if industry:
+        stmt = stmt.where(QAConversationTable.industry == industry)
+        count_stmt = count_stmt.where(QAConversationTable.industry == industry)
+    if conversation_type:
+        stmt = stmt.where(QAConversationTable.conversation_type == conversation_type)
+        count_stmt = count_stmt.where(QAConversationTable.conversation_type == conversation_type)
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
+    stmt = stmt.order_by(QAConversationTable.updated_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    items = []
+    for r in rows:
+        d = _row_to_dict(r)
+        d["message_count"] = len(d["messages"])
+        d.pop("messages", None)
+        items.append(d)
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
+@router.post("/conversations", status_code=201)
+async def create_conversation(
+    data: ConversationCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    conv_id = uuid.uuid4().hex
+    validation = validate_domain_object("qa_conversation", data.model_dump())
+    if not validation.is_valid:
+        raise HTTPException(status_code=400, detail={"errors": validation.errors, "warnings": validation.warnings})
+    row = QAConversationTable(
+        id=conv_id,
+        title=data.title,
+        messages_json="[]",
+        industry=data.industry,
+        rag_enabled=data.rag_enabled,
+        model_id=data.model_id,
+        created_by=current_user.username if hasattr(current_user, "username") else "system",
+    )
+    async with db_write(db, operation="创建对话"):
+        db.add(row)
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 3 */
+    await db.refresh(row)
+    return _row_to_dict(row)
+@router.get("/conversations/{conv_id}")
+async def get_conversation(
+    conv_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(QAConversationTable).where(QAConversationTable.id == conv_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    return _row_to_dict(row)
+@router.post("/conversations/{conv_id}/chat")
+async def chat(
+    request: Request,
+    conv_id: str,
+    data: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(QAConversationTable).where(QAConversationTable.id == conv_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    messages = []
+    try:
+        messages = json.loads(row.messages_json) if row.messages_json else []
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    _MAX_MESSAGES_PER_CONVERSATION = 1000
+    if len(messages) >= _MAX_MESSAGES_PER_CONVERSATION:
+        raise HTTPException(status_code=400, detail="对话消息数量已达上限，请创建新对话")
+    user_msg = {
+        "role": "user",
+        "content": data.message,
+        "references": [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    messages.append(user_msg)
+    rag_enabled = data.rag_enabled if data.rag_enabled is not None else row.rag_enabled
+    llm = getattr(request.app.state, "llm", None)
+    vector_store = getattr(request.app.state, "vector_store", None)
+    rag_result = None
+    rag_context = ""
+    source_documents = []
+    if rag_enabled:
+        try:
+            rag_engine = getattr(request.app.state, "qa_rag_engine", None)
+            if rag_engine is None:
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 4 */
+                rag_engine = RAGEngine(vector_store=vector_store, llm_service=llm)
+            rag_result = await rag_engine.retrieve(query=data.message, top_k=5)
+            rag_context = rag_result.context
+            source_documents = rag_result.documents
+        except Exception as exc:
+            logger.warning(f"RAG检索失败: {exc}")
+    dialogue_manager = getattr(request.app.state, "qa_dialogue_manager", None)
+    if dialogue_manager is None:
+        dialogue_manager = DialogueManager(llm_service=llm)
+    llm_messages = dialogue_manager.build_messages(
+        history=messages[:-1],
+        current_query=data.message,
+        rag_context=rag_context,
+        industry=row.industry,
+    )
+    assistant_content = ""
+    model_used = "none"
+    tokens_used = 0
+    if llm:
+        try:
+            response = await dialogue_manager.generate_response(
+                messages=llm_messages,
+                model_id=row.model_id,
+                temperature=0.7,
+                max_tokens=2048,
+            )
+            assistant_content = response.get("content", "")
+            model_used = response.get("model", "unknown")
+            tokens_used = response.get("tokens_used", 0)
+        except Exception as exc:
+            logger.error(f"LLM生成失败: {exc}")
+            assistant_content = "AI服务暂时不可用，请稍后重试"
+    else:
+        if rag_context:
+            assistant_content = f"基于检索到的相关情报数据，针对您的问题「{data.message}」，以下是相关情报摘要：\n{rag_context[:500]}"
+        else:
+            assistant_content = "当前暂无可用的分析结果，请稍后重试或联系管理员"
+    citation_tracker = getattr(request.app.state, "qa_citation_tracker", None)
+    if citation_tracker is None:
+        citation_tracker = CitationTracker()
+    citations = citation_tracker.track_citations(
+        response_text=assistant_content,
+        source_documents=source_documents,
+    )
+    references = []
+    for c in citations:
+        references.append(c.to_dict())
+    confidence_score = 0.0
+    if citations:
+        confidence_score = sum(c.relevance_score for c in citations) / len(citations)
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 5 */
+    citation_text = citation_tracker.format_citations(citations)
+    if citation_text:
+        assistant_content += citation_text
+    assistant_msg = {
+        "role": "assistant",
+        "content": assistant_content,
+        "references": references,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    messages.append(assistant_msg)
+    row.messages_json = json.dumps(messages, ensure_ascii=False, default=str)
+    row.updated_at = datetime.now(timezone.utc)
+    async with db_write(db, operation="保存对话消息"):
+        db.add(row)
+    await db.refresh(row)
+    return {
+        "conversation_id": conv_id,
+        "user_message": user_msg,
+        "assistant_message": assistant_msg,
+        "rag_enabled": rag_enabled,
+        "reference_count": len(references),
+        "citations": [c.to_dict() for c in citations],
+        "confidence_score": round(confidence_score, 4),
+        "model_used": model_used,
+        "tokens_used": tokens_used,
+        "retrieval_info": rag_result.to_dict() if rag_result else None,
+    }
+@router.get("/conversations/{conv_id}/citations")
+async def get_conversation_citations(
+    conv_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(QAConversationTable).where(QAConversationTable.id == conv_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    messages = []
+    try:
+        messages = json.loads(row.messages_json) if row.messages_json else []
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    all_citations = []
+    citation_tracker = getattr(request.app.state, "qa_citation_tracker", None)
+    if citation_tracker is None:
+        citation_tracker = CitationTracker()
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 6 */
+        refs = msg.get("references", [])
+        if not refs:
+            continue
+        source_documents = []
+        for ref in refs:
+            source_documents.append({
+                "id": ref.get("source_id", ref.get("id", "")),
+                "content": ref.get("snippet", ""),
+                "source": ref.get("source_type", ref.get("type", "unknown")),
+                "relevance": ref.get("relevance_score", ref.get("confidence", 0.5)),
+                "threat_level": ref.get("threat_level", ref.get("metadata", {}).get("threat_level", "")),
+            })
+        citations = citation_tracker.track_citations(
+            response_text=msg.get("content", ""),
+            source_documents=source_documents,
+        )
+        for c in citations:
+            citation_dict = c.to_dict()
+            citation_dict["message_created_at"] = msg.get("created_at")
+            all_citations.append(citation_dict)
+    total_relevance = sum(c.get("relevance_score", 0) for c in all_citations)
+    avg_confidence = round(total_relevance / len(all_citations), 4) if all_citations else 0.0
+    return {
+        "conversation_id": conv_id,
+        "citations": all_citations,
+        "total_citations": len(all_citations),
+        "avg_confidence": avg_confidence,
+    }
+class BatchDeleteRequest(BaseModel):
+    conversation_ids: List[str] = Field(..., min_length=1)
+@router.delete("/conversations/batch", status_code=204)
+async def batch_delete_conversations(
+    data: BatchDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(QAConversationTable).where(
+        QAConversationTable.id.in_(data.conversation_ids),
+        QAConversationTable.conversation_type != "knowledge_base",
+    )
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    found_ids = {r.id for r in rows}
+    missing_ids = set(data.conversation_ids) - found_ids
+    if missing_ids:
+        raise HTTPException(status_code=404, detail=f"以下对话不存在: {', '.join(missing_ids)}")
+    async with db_write(db, operation="批量删除对话"):
+        for row in rows:
+            await db.delete(row)
+@router.delete("/conversations/{conv_id}", status_code=204)
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 7 */
+async def delete_conversation(
+    conv_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(QAConversationTable).where(QAConversationTable.id == conv_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    async with db_write(db, operation="删除对话"):
+        await db.delete(row)
+@router.get("/statistics")
+async def get_statistics(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    total_stmt = select(func.count()).select_from(QAConversationTable).where(
+        QAConversationTable.conversation_type != "knowledge_base"
+    )
+    total_result = await db.execute(total_stmt)
+    total_conversations = total_result.scalar() or 0
+    industry_stmt = (
+        select(QAConversationTable.industry, func.count())
+        .where(QAConversationTable.conversation_type != "knowledge_base")
+        .group_by(QAConversationTable.industry)
+    )
+    industry_result = await db.execute(industry_stmt)
+    by_industry = {row[0] or "未分类": row[1] for row in industry_result.all()}
+    active_stmt = select(func.count()).select_from(QAConversationTable).where(
+        QAConversationTable.conversation_type != "knowledge_base",
+        QAConversationTable.is_active == True,
+    )
+    active_result = await db.execute(active_stmt)
+    active_count = active_result.scalar() or 0
+    inactive_count = total_conversations - active_count
+    msg_stmt = select(QAConversationTable.messages_json).where(
+        QAConversationTable.conversation_type != "knowledge_base"
+    )
+    msg_result = await db.execute(msg_stmt)
+    total_messages = 0
+    rag_enabled_count = 0
+    for (messages_json,) in msg_result.all():
+        msgs = []
+        try:
+            msgs = json.loads(messages_json) if messages_json else []
+        except (json.JSONDecodeError, TypeError):
+            msgs = []
+        total_messages += len(msgs)
+    rag_stmt = select(func.count()).select_from(QAConversationTable).where(
+        QAConversationTable.conversation_type != "knowledge_base",
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 8 */
+        QAConversationTable.rag_enabled == True,
+    )
+    rag_result = await db.execute(rag_stmt)
+    rag_enabled_count = rag_result.scalar() or 0
+    rag_ratio = round(rag_enabled_count / total_conversations, 4) if total_conversations > 0 else 0.0
+    return {
+        "total_conversations": total_conversations,
+        "by_industry": by_industry,
+        "active_count": active_count,
+        "inactive_count": inactive_count,
+        "active_ratio": round(active_count / total_conversations, 4) if total_conversations > 0 else 0.0,
+        "total_messages": total_messages,
+        "rag_enabled_count": rag_enabled_count,
+        "rag_usage_ratio": rag_ratio,
+    }
+@router.get("/industries")
+async def list_industries(
+    current_user: User = Depends(get_current_user),
+):
+    industries = [
+        {"value": "GENERAL", "label": "通用", "description": "通用威胁情报场景"},
+        {"value": "THREAT_INTEL", "label": "威胁情报", "description": "黑灰产情报分析场景"},
+        {"value": "manufacturing", "label": "智能制造", "description": "设备故障预测、产线优化、供应链风险、工控安全"},
+        {"value": "education", "label": "智慧教育", "description": "考试安全、学术诚信、在线教育平台安全"},
+        {"value": "healthcare", "label": "医疗健康", "description": "医疗数据安全、药品追溯、医保欺诈检测"},
+        {"value": "finance", "label": "金融服务", "description": "金融欺诈、反洗钱、交易安全、合规风险"},
+    ]
+    return {"industries": industries, "total": len(industries)}
+@router.post("/conversations/{conv_id}/switch-industry")
+async def switch_industry(
+    conv_id: str,
+    data: SwitchIndustryRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(QAConversationTable).where(QAConversationTable.id == conv_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    old_industry = row.industry
+    row.industry = data.industry
+    row.updated_at = datetime.now(timezone.utc)
+    async with db_write(db, operation="切换行业"):
+        db.add(row)
+    await db.refresh(row)
+    return {
+        "conversation_id": conv_id,
+        "old_industry": old_industry,
+        "new_industry": data.industry,
+    }
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 9 */
+class KnowledgeBaseCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=256)
+    description: str = ""
+    industry: Optional[str] = None
+    source_type: str = Field("manual", pattern=r"^(manual|file|api|crawl)$")
+    config_json: str = Field("{}", pattern=r'^\{.*\}$')
+class KnowledgeBaseUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+class KnowledgeBaseItemAdd(BaseModel):
+    title: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1)
+    source: str = ""
+    metadata_json: str = "{}"
+@router.get("/knowledge-bases")
+async def list_knowledge_bases(
+    industry: Optional[str] = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(QAConversationTable).where(QAConversationTable.conversation_type == "knowledge_base")
+    count_stmt = select(func.count()).select_from(QAConversationTable).where(
+        QAConversationTable.conversation_type == "knowledge_base"
+    )
+    if industry:
+        stmt = stmt.where(QAConversationTable.industry == industry)
+        count_stmt = count_stmt.where(QAConversationTable.industry == industry)
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
+    stmt = stmt.order_by(QAConversationTable.created_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    items = []
+    for r in rows:
+        items.append({
+            "id": r.id,
+            "name": r.title,
+            "description": r.description or "",
+            "industry": r.industry,
+            "is_active": r.is_active,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        })
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
+@router.post("/knowledge-bases", status_code=201)
+async def create_knowledge_base(
+    data: KnowledgeBaseCreate,
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 10 */
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    kb_id = uuid.uuid4().hex
+    try:
+        json.loads(data.config_json)
+    except (json.JSONDecodeError, TypeError):
+        raise HTTPException(status_code=422, detail="config_json格式错误")
+    row = QAConversationTable(
+        id=kb_id,
+        title=data.name,
+        description=data.description,
+        industry=data.industry,
+        conversation_type="knowledge_base",
+        is_active=True,
+        created_by=current_user.username if hasattr(current_user, "username") else "system",
+    )
+    async with db_write(db, operation="创建知识库"):
+        db.add(row)
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "name": row.title,
+        "description": row.description,
+        "industry": row.industry,
+        "source_type": data.source_type,
+        "is_active": row.is_active,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+@router.get("/knowledge-bases/{kb_id}")
+async def get_knowledge_base(
+    kb_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(QAConversationTable).where(
+            QAConversationTable.id == kb_id,
+            QAConversationTable.conversation_type == "knowledge_base",
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    return {
+        "id": row.id,
+        "name": row.title,
+        "description": row.description,
+        "industry": row.industry,
+        "is_active": row.is_active,
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 11 */
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+@router.put("/knowledge-bases/{kb_id}")
+async def update_knowledge_base(
+    kb_id: str,
+    data: KnowledgeBaseUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(QAConversationTable).where(
+            QAConversationTable.id == kb_id,
+            QAConversationTable.conversation_type == "knowledge_base",
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    if data.name is not None:
+        row.title = data.name
+    if data.description is not None:
+        row.description = data.description
+    if data.is_active is not None:
+        row.is_active = data.is_active
+    row.updated_at = datetime.now(timezone.utc)
+    async with db_write(db, operation="更新知识库"):
+        db.add(row)
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "name": row.title,
+        "description": row.description,
+        "is_active": row.is_active,
+    }
+@router.delete("/knowledge-bases/{kb_id}", status_code=204)
+async def delete_knowledge_base(
+    kb_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(QAConversationTable).where(
+            QAConversationTable.id == kb_id,
+            QAConversationTable.conversation_type == "knowledge_base",
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 12 */
+    async with db_write(db, operation="删除知识库"):
+        await db.delete(row)
+@router.post("/knowledge-bases/{kb_id}/items", status_code=201)
+async def add_knowledge_base_item(
+    kb_id: str,
+    data: KnowledgeBaseItemAdd,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(QAConversationTable).where(
+            QAConversationTable.id == kb_id,
+            QAConversationTable.conversation_type == "knowledge_base",
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    try:
+        json.loads(data.metadata_json)
+    except (json.JSONDecodeError, TypeError):
+        raise HTTPException(status_code=422, detail="metadata_json格式错误")
+    qa_engine = getattr(request.app.state, "qa_engine", None)
+    if qa_engine and hasattr(qa_engine, "add_to_knowledge_base"):
+        await qa_engine.add_to_knowledge_base(
+            kb_id=kb_id,
+            title=data.title,
+            content=data.content,
+            source=data.source,
+            metadata=data.metadata_json,
+        )
+    return {
+        "kb_id": kb_id,
+        "item_title": data.title,
+        "item_source": data.source,
+        "added": True,
+        "message": "知识条目已添加",
+    }
+@router.get("/knowledge-bases/{kb_id}/items")
+async def list_knowledge_base_items(
+    kb_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(QAConversationTable).where(
+            QAConversationTable.id == kb_id,
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 13 */
+            QAConversationTable.conversation_type == "knowledge_base",
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    messages = []
+    try:
+        messages = json.loads(row.messages_json) if row.messages_json else []
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    items = messages[offset:offset + limit]
+    return {
+        "kb_id": kb_id,
+        "items": items,
+        "total": len(messages),
+        "offset": offset,
+        "limit": limit,
+    }
+@router.get("/conversations/{conv_id}/summary")
+async def get_conversation_summary(
+    conv_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(QAConversationTable).where(QAConversationTable.id == conv_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    messages = []
+    try:
+        messages = json.loads(row.messages_json) if row.messages_json else []
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    if not messages:
+        return {
+            "conversation_id": conv_id,
+            "title": row.title,
+            "summary": "对话为空，暂无摘要",
+            "message_count": 0,
+            "key_topics": [],
+            "key_findings": [],
+        }
+    llm = getattr(request.app.state, "llm", None)
+    if llm:
+        conversation_text = "\n".join(
+            f"{'用户' if m.get('role') == 'user' else '助手'}: {m.get('content', '')[:500]}"
+            for m in messages
+        )
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 14 */
+        summary_prompt = (
+            "请对以下威胁情报对话进行摘要总结，包括：\n"
+            "1. 对话主要讨论的话题\n"
+            "2. 关键结论和发现\n"
+            "3. 涉及的威胁情报要点\n\n"
+            '请以JSON格式返回：{"summary": "摘要内容", "key_topics": ["话题1", "话题2"], "key_findings": ["发现1", "发现2"]}\n\n'
+            f"对话内容：\n{conversation_text[:4000]}"
+        )
+        dialogue_manager = getattr(request.app.state, "qa_dialogue_manager", None)
+        if dialogue_manager is None:
+            dialogue_manager = DialogueManager(llm_service=llm)
+        try:
+            response = await dialogue_manager.generate_response(
+                messages=[{"role": "user", "content": summary_prompt}],
+                temperature=0.3,
+                max_tokens=1024,
+            )
+            summary_text = response.get("content", "")
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', summary_text)
+            if json_match:
+                summary_data = json.loads(json_match.group())
+            else:
+                summary_data = {"summary": summary_text, "key_topics": [], "key_findings": []}
+        except Exception as exc:
+            logger.error(f"Conversation summary generation failed: {exc}")
+            summary_data = {"summary": "摘要生成失败", "key_topics": [], "key_findings": []}
+    else:
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        topics = [m.get("content", "")[:50] for m in user_msgs[:5]]
+        summary_data = {
+            "summary": f"共 {len(messages)} 条消息的对话，涉及 {len(user_msgs)} 个用户提问",
+            "key_topics": topics,
+            "key_findings": [],
+        }
+    return {
+        "conversation_id": conv_id,
+        "title": row.title,
+        "message_count": len(messages),
+        "summary": summary_data.get("summary", ""),
+        "key_topics": summary_data.get("key_topics", []),
+        "key_findings": summary_data.get("key_findings", []),
+    }
+@router.post("/conversations/{conv_id}/compress")
+async def compress_conversation(
+    conv_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 15 */
+    result = await db.execute(select(QAConversationTable).where(QAConversationTable.id == conv_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    messages = []
+    try:
+        messages = json.loads(row.messages_json) if row.messages_json else []
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    if not messages:
+        return {
+            "conversation_id": conv_id,
+            "original_count": 0,
+            "compressed_count": 0,
+            "messages": [],
+        }
+    llm = getattr(request.app.state, "llm", None)
+    qa_dialogue_manager = getattr(request.app.state, "qa_dialogue_manager", None)
+    if qa_dialogue_manager is None:
+        qa_dialogue_manager = DialogueManager(llm_service=llm)
+    original_count = len(messages)
+    compressed = await qa_dialogue_manager.compress_history(messages)
+    row.messages_json = json.dumps(compressed, ensure_ascii=False, default=str)
+    row.updated_at = datetime.now(timezone.utc)
+    async with db_write(db, operation="压缩对话"):
+        db.add(row)
+    await db.refresh(row)
+    return {
+        "conversation_id": conv_id,
+        "original_count": original_count,
+        "compressed_count": len(compressed),
+        "messages": compressed,
+    }
+@router.post("/conversations/{conv_id}/intent")
+async def track_conversation_intent(
+    conv_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(QAConversationTable).where(QAConversationTable.id == conv_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    messages = []
+    try:
+        messages = json.loads(row.messages_json) if row.messages_json else []
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    llm = getattr(request.app.state, "llm", None)
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 16 */
+    qa_dialogue_manager = getattr(request.app.state, "qa_dialogue_manager", None)
+    if qa_dialogue_manager is None:
+        qa_dialogue_manager = DialogueManager(llm_service=llm)
+    intent_result = qa_dialogue_manager.track_intent(messages)
+    return {
+        "conversation_id": conv_id,
+        "intents": intent_result.get("intents", []),
+        "intent_chain": intent_result.get("intent_chain", []),
+        "dominant_intent": intent_result.get("dominant_intent"),
+        "intent_transitions": intent_result.get("intent_transitions", 0),
+    }
+@router.post("/conversations/{conv_id}/evidence-chain")
+async def generate_evidence_chain(
+    conv_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(QAConversationTable).where(QAConversationTable.id == conv_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    messages = []
+    try:
+        messages = json.loads(row.messages_json) if row.messages_json else []
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    assistant_msg = None
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            assistant_msg = msg
+            break
+    if not assistant_msg:
+        return {
+            "conversation_id": conv_id,
+            "chain": [],
+            "total_steps": 0,
+            "confidence": 0.0,
+        }
+    response_text = assistant_msg.get("content", "")
+    references = assistant_msg.get("references", [])
+    source_documents = []
+    for ref in references:
+        source_documents.append({
+            "id": ref.get("source_id", ref.get("id", "")),
+            "content": ref.get("snippet", ""),
+            "source": ref.get("source_type", ref.get("type", "unknown")),
+            "relevance": ref.get("relevance_score", ref.get("confidence", 0.5)),
+        })
+    qa_citation_tracker = getattr(request.app.state, "qa_citation_tracker", None)
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 17 */
+    if qa_citation_tracker is None:
+        qa_citation_tracker = CitationTracker()
+    citations = qa_citation_tracker.track_citations(
+        response_text=response_text,
+        source_documents=source_documents,
+    )
+    evidence_chain = qa_citation_tracker.generate_evidence_chain(response_text, citations)
+    return {
+        "conversation_id": conv_id,
+        "chain": evidence_chain.get("chain", []),
+        "total_steps": evidence_chain.get("total_steps", 0),
+        "confidence": evidence_chain.get("confidence", 0.0),
+    }
+class RAGQueryRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    query: str = Field(..., min_length=1, max_length=2000)
+    top_k: int = Field(5, ge=1, le=20)
+    conversation_id: Optional[str] = None
+@router.post("/rag-query")
+async def rag_query(
+    data: RAGQueryRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    dialogue_manager = getattr(request.app.state, "qa_dialogue_manager", None)
+    if not dialogue_manager:
+        llm = getattr(request.app.state, "llm", None)
+        dialogue_manager = DialogueManager(llm_service=llm)
+    result = await dialogue_manager.answer_with_citations(
+        query=data.query,
+        conversation_id=data.conversation_id,
+        top_k=data.top_k,
+    )
+    return result
+class MultiTurnRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    query: str = Field(..., min_length=1, max_length=2000)
+@router.post("/conversations/{conv_id}/turn")
+async def multi_turn_conversation(
+    conv_id: str,
+    data: MultiTurnRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    dialogue_manager = getattr(request.app.state, "qa_dialogue_manager", None)
+    if not dialogue_manager:
+        llm = getattr(request.app.state, "llm", None)
+        dialogue_manager = DialogueManager(llm_service=llm)
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 18 */
+    result = await dialogue_manager.multi_turn_query(
+        conversation_id=conv_id,
+        query=data.query,
+        db_session=db,
+    )
+    return result
+# ============================================================
+# File: api/translation.py
+# ============================================================
+import uuid
+from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.auth import User, get_current_user
+from app.core.db_utils import db_write
+from app.core.translation_engine import TranslationEngine
+from app.db.database import get_db
+from app.db.tables import TranslationMemoryTable, TerminologyTable
+router = APIRouter(prefix="/translation", tags=["自动翻译"])
+class TranslateRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    source_lang: str = "zh"
+    target_lang: str = "en"
+    domain: Optional[str] = None
+class BatchTranslateRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    texts: List[str] = Field(..., min_length=1, max_length=100)
+    source_lang: str = Field("zh", max_length=8)
+    target_lang: str = Field("en", max_length=8)
+    domain: Optional[str] = None
+class TerminologyCreate(BaseModel):
+    term: str = Field(..., min_length=1, max_length=256)
+    translation: str = Field(..., min_length=1, max_length=256)
+    source_lang: str = "zh"
+    target_lang: str = "en"
+    domain: Optional[str] = None
+    note: Optional[str] = None
+class TMCreate(BaseModel):
+    source_text: str = Field(..., min_length=1)
+    target_text: str = Field(..., min_length=1)
+    source_lang: str = "zh"
+    target_lang: str = "en"
+    domain: Optional[str] = None
+SUPPORTED_LANGUAGES = [
+    {"code": "zh", "name": "中文", "native": "中文"},
+    {"code": "en", "name": "英语", "native": "English"},
+    {"code": "ja", "name": "日语", "native": "日本語"},
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 19 */
+    {"code": "ko", "name": "韩语", "native": "한국어"},
+    {"code": "ru", "name": "俄语", "native": "Русский"},
+    {"code": "de", "name": "德语", "native": "Deutsch"},
+    {"code": "fr", "name": "法语", "native": "Français"},
+    {"code": "es", "name": "西班牙语", "native": "Español"},
+    {"code": "ar", "name": "阿拉伯语", "native": "العربية"},
+]
+async def _get_translation_engine(request: Request, db: AsyncSession) -> TranslationEngine:
+    engine = getattr(request.app.state, "translation_engine", None)
+    if engine is not None:
+        return engine
+    llm = getattr(request.app.state, "llm", None)
+    engine = TranslationEngine(llm_service=llm)
+    tm_result = await db.execute(select(TranslationMemoryTable))
+    tm_rows = tm_result.scalars().all()
+    engine.load_translation_memories([
+        {
+            "id": r.id,
+            "source_text": r.source_text,
+            "target_text": r.target_text,
+            "source_lang": r.source_lang,
+            "target_lang": r.target_lang,
+            "domain": r.domain,
+        }
+        for r in tm_rows
+    ])
+    term_result = await db.execute(select(TerminologyTable))
+    term_rows = term_result.scalars().all()
+    engine.load_terminology_list([
+        {
+            "term": r.term,
+            "translation": r.translation,
+            "source_lang": r.source_lang,
+            "target_lang": r.target_lang,
+        }
+        for r in term_rows
+    ])
+    return engine
+@router.post("/reload")
+async def reload_translation_data(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    engine = getattr(request.app.state, "translation_engine", None)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="翻译引擎未初始化")
+    tm_result = await db.execute(select(TranslationMemoryTable))
+    tm_rows = tm_result.scalars().all()
+    engine.load_translation_memories([
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 20 */
+        {
+            "id": r.id,
+            "source_text": r.source_text,
+            "target_text": r.target_text,
+            "source_lang": r.source_lang,
+            "target_lang": r.target_lang,
+            "domain": r.domain,
+        }
+        for r in tm_rows
+    ])
+    term_result = await db.execute(select(TerminologyTable))
+    term_rows = term_result.scalars().all()
+    engine.load_terminology_list([
+        {
+            "term": r.term,
+            "translation": r.translation,
+            "source_lang": r.source_lang,
+            "target_lang": r.target_lang,
+        }
+        for r in term_rows
+    ])
+    return {"reloaded": True, "tm_count": len(tm_rows), "terminology_count": len(term_rows)}
+INDUSTRY_TERMS = {
+    "manufacturing": [
+        {"term": "供应链攻击", "translation": "Supply Chain Attack", "source_lang": "zh", "target_lang": "en"},
+        {"term": "工控系统", "translation": "Industrial Control System", "source_lang": "zh", "target_lang": "en"},
+        {"term": "SCADA系统", "translation": "SCADA System", "source_lang": "zh", "target_lang": "en"},
+        {"term": "PLC劫持", "translation": "PLC Hijacking", "source_lang": "zh", "target_lang": "en"},
+        {"term": "勒索软件", "translation": "Ransomware", "source_lang": "zh", "target_lang": "en"},
+        {"term": "OT网络", "translation": "Operational Technology Network", "source_lang": "zh", "target_lang": "en"},
+        {"term": "工业间谍", "translation": "Industrial Espionage", "source_lang": "zh", "target_lang": "en"},
+        {"term": "知识产权窃取", "translation": "Intellectual Property Theft", "source_lang": "zh", "target_lang": "en"},
+        {"term": "固件植入", "translation": "Firmware Implant", "source_lang": "zh", "target_lang": "en"},
+        {"term": "设备篡改", "translation": "Device Tampering", "source_lang": "zh", "target_lang": "en"},
+    ],
+    "education": [
+        {"term": "钓鱼攻击", "translation": "Phishing Attack", "source_lang": "zh", "target_lang": "en"},
+        {"term": "数据泄露", "translation": "Data Breach", "source_lang": "zh", "target_lang": "en"},
+        {"term": "身份冒用", "translation": "Identity Spoofing", "source_lang": "zh", "target_lang": "en"},
+        {"term": "远程代码执行", "translation": "Remote Code Execution", "source_lang": "zh", "target_lang": "en"},
+        {"term": "学术欺诈", "translation": "Academic Fraud", "source_lang": "zh", "target_lang": "en"},
+        {"term": "论文代写", "translation": "Ghostwriting Service", "source_lang": "zh", "target_lang": "en"},
+        {"term": "题库泄露", "translation": "Exam Question Bank Leak", "source_lang": "zh", "target_lang": "en"},
+        {"term": "学历造假", "translation": "Degree Forgery", "source_lang": "zh", "target_lang": "en"},
+        {"term": "考试作弊产业链", "translation": "Exam Cheating Chain", "source_lang": "zh", "target_lang": "en"},
+        {"term": "在线代考", "translation": "Online Proxy Testing", "source_lang": "zh", "target_lang": "en"},
+    ],
+    "healthcare": [
+        {"term": "医疗数据泄露", "translation": "Healthcare Data Breach", "source_lang": "zh", "target_lang": "en"},
+        {"term": "医疗设备漏洞", "translation": "Medical Device Vulnerability", "source_lang": "zh", "target_lang": "en"},
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 21 */
+        {"term": "电子病历", "translation": "Electronic Health Record", "source_lang": "zh", "target_lang": "en"},
+        {"term": "勒索病毒", "translation": "Ransomware Virus", "source_lang": "zh", "target_lang": "en"},
+        {"term": "假药流通", "translation": "Counterfeit Drug Distribution", "source_lang": "zh", "target_lang": "en"},
+        {"term": "医保欺诈", "translation": "Health Insurance Fraud", "source_lang": "zh", "target_lang": "en"},
+        {"term": "医疗数据交易", "translation": "Medical Data Trafficking", "source_lang": "zh", "target_lang": "en"},
+        {"term": "处方药非法销售", "translation": "Illegal Prescription Drug Sales", "source_lang": "zh", "target_lang": "en"},
+    ],
+    "finance": [
+        {"term": "金融诈骗", "translation": "Financial Fraud", "source_lang": "zh", "target_lang": "en"},
+        {"term": "信用卡欺诈", "translation": "Credit Card Fraud", "source_lang": "zh", "target_lang": "en"},
+        {"term": "洗钱", "translation": "Money Laundering", "source_lang": "zh", "target_lang": "en"},
+        {"term": "网络钓鱼", "translation": "Cyber Phishing", "source_lang": "zh", "target_lang": "en"},
+        {"term": "交易异常检测", "translation": "Anomalous Transaction Detection", "source_lang": "zh", "target_lang": "en"},
+        {"term": "银行木马", "translation": "Banking Trojan", "source_lang": "zh", "target_lang": "en"},
+        {"term": "支付系统攻击", "translation": "Payment System Attack", "source_lang": "zh", "target_lang": "en"},
+        {"term": "数字货币犯罪", "translation": "Cryptocurrency Crime", "source_lang": "zh", "target_lang": "en"},
+        {"term": "电信诈骗", "translation": "Telecom Fraud", "source_lang": "zh", "target_lang": "en"},
+        {"term": "非法集资", "translation": "Illegal Fundraising", "source_lang": "zh", "target_lang": "en"},
+        {"term": "套路贷", "translation": "Predatory Lending Trap", "source_lang": "zh", "target_lang": "en"},
+        {"term": "资金盘", "translation": "Ponzi Scheme Platform", "source_lang": "zh", "target_lang": "en"},
+    ],
+    "blacktalk": [
+        {"term": "跑分", "translation": "Money Laundering Relay", "source_lang": "zh", "target_lang": "en"},
+        {"term": "杀猪盘", "translation": "Pig Butchering Scam", "source_lang": "zh", "target_lang": "en"},
+        {"term": "四件套", "translation": "Four-Piece Identity Kit", "source_lang": "zh", "target_lang": "en"},
+        {"term": "猫池", "translation": "SMS Pool Device", "source_lang": "zh", "target_lang": "en"},
+        {"term": "水房", "translation": "Money Laundering Operation", "source_lang": "zh", "target_lang": "en"},
+        {"term": "料子", "translation": "Stolen Personal Data", "source_lang": "zh", "target_lang": "en"},
+        {"term": "车手", "translation": "Cash Withdrawal Mule", "source_lang": "zh", "target_lang": "en"},
+        {"term": "肉鸡", "translation": "Zombie Host", "source_lang": "zh", "target_lang": "en"},
+        {"term": "话术", "translation": "Social Engineering Script", "source_lang": "zh", "target_lang": "en"},
+        {"term": "接码", "translation": "Verification Code Receiving Service", "source_lang": "zh", "target_lang": "en"},
+        {"term": "养号", "translation": "Account Farming", "source_lang": "zh", "target_lang": "en"},
+        {"term": "黑料", "translation": "Illicit Data / Compromising Information", "source_lang": "zh", "target_lang": "en"},
+        {"term": "卡商", "translation": "Bank Card Dealer", "source_lang": "zh", "target_lang": "en"},
+        {"term": "料商", "translation": "Stolen Data Dealer", "source_lang": "zh", "target_lang": "en"},
+        {"term": "引流", "translation": "Traffic Diversion for Black Market", "source_lang": "zh", "target_lang": "en"},
+        {"term": "色流", "translation": "Adult Traffic Diversion", "source_lang": "zh", "target_lang": "en"},
+        {"term": "菠菜", "translation": "Online Gambling (Euphemism)", "source_lang": "zh", "target_lang": "en"},
+        {"term": "黑卡", "translation": "Illicit Bank Card", "source_lang": "zh", "target_lang": "en"},
+        {"term": "拦截卡", "translation": "Intercept SIM Card", "source_lang": "zh", "target_lang": "en"},
+        {"term": "马仔", "translation": "Low-Level Operative", "source_lang": "zh", "target_lang": "en"},
+        {"term": "套现", "translation": "Illegal Cash-Out", "source_lang": "zh", "target_lang": "en"},
+        {"term": "代付", "translation": "Proxy Payment Service", "source_lang": "zh", "target_lang": "en"},
+        {"term": "实名", "translation": "Real-Name Verified Identity", "source_lang": "zh", "target_lang": "en"},
+        {"term": "裸贷", "translation": "Naked-Photo Collateral Loan", "source_lang": "zh", "target_lang": "en"},
+    ],
+}
+@router.get("/industry-terms")
+async def get_industry_terms(
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 22 */
+    industry: Optional[str] = Query(None, description="行业筛选: manufacturing, education, healthcare, finance, blacktalk"),
+    current_user: User = Depends(get_current_user),
+):
+    if industry:
+        if industry not in INDUSTRY_TERMS:
+            raise HTTPException(status_code=400, detail=f"不支持的行业: {industry}，可选值: {', '.join(INDUSTRY_TERMS.keys())}")
+        return {"industry": industry, "terms": INDUSTRY_TERMS[industry], "total": len(INDUSTRY_TERMS[industry])}
+    all_terms = []
+    for ind, terms in INDUSTRY_TERMS.items():
+        for t in terms:
+            t_copy = dict(t)
+            t_copy["industry"] = ind
+            all_terms.append(t_copy)
+    return {"terms": all_terms, "total": len(all_terms), "industries": list(INDUSTRY_TERMS.keys())}
+@router.post("/translate")
+async def translate(
+    data: TranslateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    engine = await _get_translation_engine(request, db)
+    result = await engine.translate(
+        text=data.text,
+        source_lang=data.source_lang,
+        target_lang=data.target_lang,
+        domain=data.domain,
+    )
+    return result.to_dict()
+@router.post("/batch-translate")
+async def batch_translate(
+    data: BatchTranslateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    engine = await _get_translation_engine(request, db)
+    results = await engine.batch_translate(
+        texts=data.texts,
+        source_lang=data.source_lang,
+        target_lang=data.target_lang,
+        domain=data.domain,
+    )
+    return {
+        "results": [r.to_dict() for r in results],
+        "source_lang": data.source_lang,
+        "target_lang": data.target_lang,
+        "total": len(results),
+    }
+@router.get("/tm-matches")
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 23 */
+async def find_tm_matches(
+    request: Request,
+    text: str = Query(..., min_length=1),
+    source_lang: str = Query("zh"),
+    target_lang: str = Query("en"),
+    top_k: int = Query(3, ge=1, le=10),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    engine = await _get_translation_engine(request, db)
+    matches = engine.find_tm_matches(text, source_lang, target_lang, top_k)
+    return {"matches": matches, "total": len(matches)}
+@router.post("/tm", status_code=201)
+async def create_translation_memory(
+    data: TMCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    tm_id = uuid.uuid4().hex
+    row = TranslationMemoryTable(
+        id=tm_id,
+        source_text=data.source_text,
+        source_lang=data.source_lang,
+        target_text=data.target_text,
+        target_lang=data.target_lang,
+        domain=data.domain,
+    )
+    async with db_write(db, operation="创建翻译记忆"):
+        db.add(row)
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "source_text": row.source_text,
+        "source_lang": row.source_lang,
+        "target_text": row.target_text,
+        "target_lang": row.target_lang,
+        "domain": row.domain,
+    }
+@router.get("/languages")
+async def list_languages(
+    current_user: User = Depends(get_current_user),
+):
+    return {"languages": SUPPORTED_LANGUAGES, "total": len(SUPPORTED_LANGUAGES)}
+@router.get("/terminology")
+async def list_terminology(
+    source_lang: Optional[str] = None,
+    target_lang: Optional[str] = None,
+    domain: Optional[str] = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 24 */
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(TerminologyTable)
+    count_stmt = select(func.count()).select_from(TerminologyTable)
+    if source_lang:
+        stmt = stmt.where(TerminologyTable.source_lang == source_lang)
+        count_stmt = count_stmt.where(TerminologyTable.source_lang == source_lang)
+    if target_lang:
+        stmt = stmt.where(TerminologyTable.target_lang == target_lang)
+        count_stmt = count_stmt.where(TerminologyTable.target_lang == target_lang)
+    if domain:
+        stmt = stmt.where(TerminologyTable.domain == domain)
+        count_stmt = count_stmt.where(TerminologyTable.domain == domain)
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
+    stmt = stmt.order_by(TerminologyTable.created_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    items = [
+        {
+            "id": r.id,
+            "term": r.term,
+            "translation": r.translation,
+            "source_lang": r.source_lang,
+            "target_lang": r.target_lang,
+            "domain": r.domain,
+            "note": r.note,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
+class TMUpdateRequest(BaseModel):
+    source_text: Optional[str] = None
+    target_text: Optional[str] = None
+    source_lang: Optional[str] = None
+    target_lang: Optional[str] = None
+    domain: Optional[str] = None
+@router.put("/tm/{tm_id}")
+async def update_translation_memory(
+    tm_id: str,
+    data: TMUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(TranslationMemoryTable).where(TranslationMemoryTable.id == tm_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="翻译记忆不存在")
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 25 */
+    update_data = data.model_dump(exclude_unset=True)
+    async with db_write(db, operation="更新翻译记忆"):
+        for key, value in update_data.items():
+            if hasattr(row, key) and value is not None:
+                setattr(row, key, value)
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "source_text": row.source_text,
+        "target_text": row.target_text,
+        "source_lang": row.source_lang,
+        "target_lang": row.target_lang,
+        "domain": row.domain,
+        "updated": True,
+    }
+@router.delete("/tm/{tm_id}", status_code=204)
+async def delete_translation_memory(
+    tm_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(TranslationMemoryTable).where(TranslationMemoryTable.id == tm_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="翻译记忆不存在")
+    async with db_write(db, operation="删除翻译记忆"):
+        await db.delete(row)
+@router.post("/terminology/batch", status_code=201)
+async def batch_create_terminology(
+    items: List[TerminologyCreate],
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    created = []
+    async with db_write(db, operation="批量创建术语"):
+        for item in items:
+            term_id = uuid.uuid4().hex
+            row = TerminologyTable(
+                id=term_id,
+                term=item.term,
+                translation=item.translation,
+                source_lang=item.source_lang,
+                target_lang=item.target_lang,
+                domain=item.domain,
+                note=item.note,
+            )
+            db.add(row)
+            created.append({"id": term_id, "term": item.term, "translation": item.translation})
+    return {"created": created, "total": len(created)}
+@router.post("/tm/batch", status_code=201)
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 26 */
+async def batch_create_translation_memory(
+    items: List[TMCreate],
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    created = []
+    async with db_write(db, operation="批量创建翻译记忆"):
+        for item in items:
+            tm_id = uuid.uuid4().hex
+            row = TranslationMemoryTable(
+                id=tm_id,
+                source_text=item.source_text,
+                target_text=item.target_text,
+                source_lang=item.source_lang,
+                target_lang=item.target_lang,
+                domain=item.domain,
+            )
+            db.add(row)
+            created.append({"id": tm_id, "source_text": item.source_text[:50], "target_text": item.target_text[:50]})
+    return {"created": created, "total": len(created)}
+class TerminologyUpdateRequest(BaseModel):
+    term: Optional[str] = None
+    translation: Optional[str] = None
+    domain: Optional[str] = None
+    note: Optional[str] = None
+@router.put("/terminology/{term_id}")
+async def update_terminology(
+    term_id: str,
+    data: TerminologyUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(TerminologyTable).where(TerminologyTable.id == term_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="术语不存在")
+    update_data = data.model_dump(exclude_unset=True)
+    async with db_write(db, operation="更新术语"):
+        for key, value in update_data.items():
+            if hasattr(row, key) and value is not None:
+                setattr(row, key, value)
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "term": row.term,
+        "translation": row.translation,
+        "source_lang": row.source_lang,
+        "target_lang": row.target_lang,
+        "domain": row.domain,
+        "note": row.note,
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 27 */
+        "updated": True,
+    }
+@router.post("/terminology", status_code=201)
+async def create_terminology(
+    data: TerminologyCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    term_id = uuid.uuid4().hex
+    row = TerminologyTable(
+        id=term_id,
+        term=data.term,
+        translation=data.translation,
+        source_lang=data.source_lang,
+        target_lang=data.target_lang,
+        domain=data.domain,
+        note=data.note,
+    )
+    async with db_write(db, operation="创建术语"):
+        db.add(row)
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "term": row.term,
+        "translation": row.translation,
+        "source_lang": row.source_lang,
+        "target_lang": row.target_lang,
+        "domain": row.domain,
+        "note": row.note,
+    }
+@router.delete("/terminology/{term_id}", status_code=204)
+async def delete_terminology(
+    term_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(TerminologyTable).where(TerminologyTable.id == term_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="术语不存在")
+    async with db_write(db, operation="删除术语"):
+        await db.delete(row)
+@router.get("/translation-memory")
+async def list_translation_memory(
+    source_lang: Optional[str] = None,
+    target_lang: Optional[str] = None,
+    domain: Optional[str] = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 28 */
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(TranslationMemoryTable)
+    count_stmt = select(func.count()).select_from(TranslationMemoryTable)
+    if source_lang:
+        stmt = stmt.where(TranslationMemoryTable.source_lang == source_lang)
+        count_stmt = count_stmt.where(TranslationMemoryTable.source_lang == source_lang)
+    if target_lang:
+        stmt = stmt.where(TranslationMemoryTable.target_lang == target_lang)
+        count_stmt = count_stmt.where(TranslationMemoryTable.target_lang == target_lang)
+    if domain:
+        stmt = stmt.where(TranslationMemoryTable.domain == domain)
+        count_stmt = count_stmt.where(TranslationMemoryTable.domain == domain)
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
+    stmt = stmt.order_by(TranslationMemoryTable.created_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    items = [
+        {
+            "id": r.id,
+            "source_text": r.source_text,
+            "source_lang": r.source_lang,
+            "target_text": r.target_text,
+            "target_lang": r.target_lang,
+            "domain": r.domain,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
+class QualityScoreRequest(BaseModel):
+    source: str = Field(..., min_length=1)
+    translation: str = Field(..., min_length=1)
+    source_lang: str = Field("zh", max_length=8)
+    target_lang: str = Field("en", max_length=8)
+class DetectLanguageRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+class LLMTranslateRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    text: str = Field(..., min_length=1, max_length=10000)
+    source_lang: str = Field("zh", max_length=8)
+    target_lang: str = Field("en", max_length=8)
+    domain: Optional[str] = None
+@router.post("/quality-score")
+async def score_translation_quality(
+    data: QualityScoreRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 29 */
+):
+    engine = await _get_translation_engine(request, db)
+    result = await engine.get_translation_quality_score(
+        source=data.source,
+        translation=data.translation,
+        source_lang=data.source_lang,
+        target_lang=data.target_lang,
+    )
+    return result
+@router.post("/detect-language")
+async def detect_language(
+    data: DetectLanguageRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    engine = await _get_translation_engine(request, db)
+    result = await engine.detect_language(text=data.text)
+    return result
+@router.post("/translate-llm")
+async def translate_with_llm(
+    data: LLMTranslateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    engine = await _get_translation_engine(request, db)
+    result = await engine.translate_with_llm(
+        text=data.text,
+        source_lang=data.source_lang,
+        target_lang=data.target_lang,
+        domain=data.domain,
+    )
+    return result
+class TMBatchDeleteRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    ids: List[str] = Field(..., min_length=1, max_length=200)
+@router.delete("/memory/batch")
+async def batch_delete_translation_memory(
+    data: TMBatchDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(TranslationMemoryTable).where(TranslationMemoryTable.id.in_(data.ids))
+    )
+    rows = result.scalars().all()
+    found_ids = {r.id for r in rows}
+    missing_ids = set(data.ids) - found_ids
+    async with db_write(db, operation="批量删除翻译记忆"):
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 30 */
+        for row in rows:
+            await db.delete(row)
+    return {
+        "deleted": len(rows),
+        "missing_ids": list(missing_ids),
+        "requested": len(data.ids),
+    }
+@router.get("/statistics")
+async def get_translation_statistics(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    tm_count_result = await db.execute(select(func.count()).select_from(TranslationMemoryTable))
+    tm_count = tm_count_result.scalar() or 0
+    term_count_result = await db.execute(select(func.count()).select_from(TerminologyTable))
+    term_count = term_count_result.scalar() or 0
+    tm_domain_result = await db.execute(
+        select(TranslationMemoryTable.domain, func.count()).group_by(TranslationMemoryTable.domain)
+    )
+    tm_domain_distribution = {row[0] or "未分类": row[1] for row in tm_domain_result.all()}
+    term_domain_result = await db.execute(
+        select(TerminologyTable.domain, func.count()).group_by(TerminologyTable.domain)
+    )
+    term_domain_distribution = {row[0] or "未分类": row[1] for row in term_domain_result.all()}
+    tm_lang_result = await db.execute(
+        select(
+            TranslationMemoryTable.source_lang,
+            TranslationMemoryTable.target_lang,
+            func.count(),
+        ).group_by(TranslationMemoryTable.source_lang, TranslationMemoryTable.target_lang)
+    )
+    tm_lang_distribution = [
+        {"source_lang": row[0], "target_lang": row[1], "count": row[2]}
+        for row in tm_lang_result.all()
+    ]
+    term_lang_result = await db.execute(
+        select(
+            TerminologyTable.source_lang,
+            TerminologyTable.target_lang,
+            func.count(),
+        ).group_by(TerminologyTable.source_lang, TerminologyTable.target_lang)
+    )
+    term_lang_distribution = [
+        {"source_lang": row[0], "target_lang": row[1], "count": row[2]}
+        for row in term_lang_result.all()
+    ]
+    return {
+        "tm_count": tm_count,
+        "terminology_count": term_count,
+        "tm_domain_distribution": tm_domain_distribution,
+
+/* ............................................................ 中间代码省略 ............................................................ */
+
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 31 */
+    { value: 'GENERAL', label: '通用' },
+    { value: 'MANUFACTURING', label: '智能制造' },
+    { value: 'EDUCATION', label: '智慧教育' },
+    { value: 'MEDICAL', label: '医疗健康' },
+    { value: 'FINANCE', label: '金融服务' },
+  ]);
+  const [ragEnabled, setRagEnabled] = useState(true);
+  const endRef = useRef<HTMLDivElement>(null);
+  const fetchConversations = async () => {
+    setConvLoading(true);
+    try {
+      const res = await api.smartqa.listConversations();
+      const d = res as Record<string, unknown>;
+      setConversations((d?.items || d?.conversations || d?.data || []) as Record<string, unknown>[]);
+    } catch {
+      setConversations([]);
+    } finally {
+      setConvLoading(false);
+    }
+  };
+  const fetchIndustries = async () => {
+    try {
+      const res = await api.smartqa.getIndustries();
+      const d = res as Record<string, unknown>;
+      const list = (d?.industries || d?.items || d?.data || []) as Array<Record<string, unknown>>;
+      if (list.length > 0) {
+        setIndustries(
+          list.map((item) => ({
+            value: String(item.value || item.id || item.key || ''),
+            label: String(item.label || item.name || item.value || ''),
+          }))
+        );
+      }
+    } catch {}
+  };
+  useEffect(() => {
+    fetchConversations();
+    fetchIndustries();
+  }, []);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, loading]);
+  const handleNewConversation = async () => {
+    try {
+      const res = await api.smartqa.createConversation({
+        title: `对话 ${conversations.length + 1}`,
+        industry_context: industry,
+      });
+      const d = res as Record<string, unknown>;
+      const id = String(d.id || d.conversation_id || d.conversationId || '');
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 32 */
+      setCurrentConvId(id);
+      setMessages([]);
+      fetchConversations();
+    } catch {
+      message.error('创建对话失败');
+    }
+  };
+  const handleDeleteConversation = async (id: string) => {
+    try {
+      await api.smartqa.deleteConversation(id);
+      if (currentConvId === id) {
+        setCurrentConvId(null);
+        setMessages([]);
+      }
+      fetchConversations();
+    } catch {
+      message.error('删除失败');
+    }
+  };
+  const handleSelectConversation = async (id: string) => {
+    setCurrentConvId(id);
+    try {
+      const res = await api.smartqa.getConversation(id);
+      const d = res as Record<string, unknown>;
+      const msgs = (d?.messages || d?.items || []) as ChatMsg[];
+      setMessages(msgs.length > 0 ? msgs : []);
+    } catch {
+      setMessages([]);
+    }
+  };
+  const handleSend = async () => {
+    if (!input.trim()) { message.warning('请输入问题'); return; }
+    const msg = input.trim();
+    if (!msg || loading) return;
+    setInput('');
+    setMessages((prev) => [...prev, { role: 'user', content: msg }]);
+    setLoading(true);
+    try {
+      let convId = currentConvId;
+      if (!convId) {
+        const res = await api.smartqa.createConversation({
+          title: `对话 ${conversations.length + 1}`,
+          industry_context: industry,
+        });
+        const d = res as Record<string, unknown>;
+        convId = String(d.id || d.conversation_id || d.conversationId || '');
+        setCurrentConvId(convId);
+        fetchConversations();
+      }
+      const chatRes = await api.smartqa.chat(convId!, msg);
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 33 */
+      const cd = chatRes as Record<string, unknown>;
+      const extractStr = (v: unknown): string => {
+        if (typeof v === 'string') return v;
+        if (v && typeof v === 'object') {
+          const o = v as Record<string, unknown>;
+          return String(o.text || o.content || o.message || o.response || o.answer || '');
+        }
+        return '';
+      };
+      const content =
+        extractStr(cd?.response) ||
+        extractStr(cd?.content) ||
+        extractStr(cd?.message) ||
+        extractStr(cd?.answer) ||
+        extractStr(cd?.text) ||
+        extractStr(cd?.reply) ||
+        '分析完成';
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content },
+      ]);
+    } catch (err) {
+      message.error(getErrorMessage(err));
+      setMessages((prev) => [...prev, { role: 'assistant', content: '请求失败，请检查后端服务' }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && e.ctrlKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+  return (
+    <div style={{ display: 'flex', height: 'calc(100vh - 90px)', background: 'var(--bg-0)' }}>
+      <div
+        style={{
+          width: 240,
+          flexShrink: 0,
+          background: 'var(--bg-1)',
+          borderRight: '1px solid var(--border)',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        <div style={{ padding: '20px 16px 12px' }}>
+          <Button
+            icon={<PlusOutlined />}
+            onClick={handleNewConversation}
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 34 */
+            block
+            style={{
+              background: 'var(--accent-dim)',
+              border: '1px solid var(--border-accent)',
+              color: 'var(--accent)',
+              fontWeight: 600,
+              borderRadius: 'var(--radius)',
+            }}
+          >
+            新建会话
+          </Button>
+        </div>
+        <div style={{ padding: '0 16px 16px' }}>
+          <div
+            style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 10,
+              textTransform: 'uppercase' as const,
+              color: 'var(--text-3)',
+              letterSpacing: '0.08em',
+              marginBottom: 6,
+            }}
+          >
+            行业上下文
+          </div>
+          <Select
+            value={industry}
+            onChange={setIndustry}
+            style={{ width: '100%' }}
+            size="small"
+            options={industries}
+          />
+        </div>
+        <div
+          style={{
+            height: 1,
+            background: 'var(--border)',
+            margin: '0 16px',
+          }}
+        />
+        <div style={{ flex: 1, overflow: 'auto', padding: '8px 8px' }}>
+          {convLoading ? (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: 32 }}>
+              <Spin size="small" />
+            </div>
+          ) : conversations.length === 0 ? (
+            <Empty description="暂无对话，开始新对话吧" />
+          ) : (
+            conversations.map((conv) => {
+              const id = String(conv.id || conv.conversation_id || conv.conversationId || '');
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 35 */
+              const isActive = id === currentConvId;
+              const title = String(conv.title || conv.name || '对话');
+              return (
+                <div
+                  key={id}
+                  onClick={() => handleSelectConversation(id)}
+                  style={{
+                    padding: '10px 12px',
+                    cursor: 'pointer',
+                    borderRadius: 'var(--radius)',
+                    background: isActive ? 'var(--accent-dim)' : 'transparent',
+                    marginBottom: 2,
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    transition: 'background 0.15s',
+                    borderLeft: isActive ? '2px solid var(--accent)' : '2px solid transparent',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!isActive) (e.currentTarget as HTMLDivElement).style.background = 'var(--bg-2)';
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!isActive) (e.currentTarget as HTMLDivElement).style.background = 'transparent';
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: 13,
+                      color: isActive ? 'var(--accent)' : 'var(--text-1)',
+                      fontWeight: isActive ? 500 : 400,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      flex: 1,
+                    }}
+                  >
+                    {title}
+                  </span>
+                  <Popconfirm
+                    title="确认删除此对话？"
+                    onConfirm={(e) => {
+                      e?.stopPropagation();
+                      handleDeleteConversation(id);
+                    }}
+                    onCancel={(e) => e?.stopPropagation()}
+                    okText="删除"
+                    cancelText="取消"
+                  >
+                    <DeleteOutlined
+                      style={{ fontSize: 11, color: 'var(--text-3)', marginLeft: 8, flexShrink: 0 }}
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 36 */
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </Popconfirm>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        <div
+          style={{
+            padding: '16px 28px',
+            borderBottom: '1px solid var(--border)',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            background: 'var(--bg-1)',
+          }}
+        >
+          <div>
+            <div
+              style={{
+                fontFamily: 'var(--font-display)',
+                fontSize: 28,
+                fontWeight: 400,
+                color: 'var(--text-0)',
+                letterSpacing: '-0.02em',
+                lineHeight: 1.1,
+              }}
+            >
+              智能问答
+            </div>
+            <div
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: 10,
+                textTransform: 'uppercase' as const,
+                color: 'var(--text-3)',
+                letterSpacing: '0.1em',
+                marginTop: 2,
+              }}
+            >
+              基于情报的智能对话
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)',
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 37 */
+                fontSize: 10,
+                textTransform: 'uppercase' as const,
+                color: 'var(--text-3)',
+                letterSpacing: '0.08em',
+              }}
+            >
+              RAG
+            </span>
+            <Switch checked={ragEnabled} onChange={setRagEnabled} size="small" />
+          </div>
+        </div>
+        <div style={{ flex: 1, overflow: 'auto', padding: 28 }}>
+          {messages.length === 0 ? (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                height: '100%',
+                gap: 16,
+              }}
+            >
+              <div
+                style={{
+                  width: 64,
+                  height: 64,
+                  borderRadius: '50%',
+                  background: 'var(--accent-dim)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  border: '1px solid var(--border-accent)',
+                }}
+              >
+                <MessageOutlined style={{ fontSize: 24, color: 'var(--accent)' }} />
+              </div>
+              <div
+                style={{
+                  fontFamily: 'var(--font-display)',
+                  fontSize: 24,
+                  fontWeight: 400,
+                  color: 'var(--text-0)',
+                  letterSpacing: '-0.02em',
+                }}
+              >
+                开始对话
+              </div>
+              <div
+                style={{
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 38 */
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 11,
+                  color: 'var(--text-3)',
+                  textTransform: 'uppercase' as const,
+                  letterSpacing: '0.06em',
+                }}
+              >
+                Ctrl + Enter 发送
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+              {messages.map((msg, i) => (
+                <div
+                  key={i}
+                  style={{
+                    display: 'flex',
+                    justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                  }}
+                >
+                  <div
+                    style={{
+                      maxWidth: '70%',
+                      padding: '14px 18px',
+                      background: msg.role === 'user' ? 'var(--bg-3)' : 'var(--bg-1)',
+                      color: msg.role === 'user' ? 'var(--text-0)' : 'var(--text-1)',
+                      borderRadius: 'var(--radius-lg)',
+                      fontSize: 14,
+                      lineHeight: 1.75,
+                      border: msg.role === 'user' ? '1px solid var(--border-hover)' : '1px solid var(--border)',
+                    }}
+                  >
+                    {msg.role === 'assistant' ? (
+                      <div className="ai-msg-markdown">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                      </div>
+                    ) : (
+                      <span style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {loading && (
+                <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
+                  <div
+                    style={{
+                      padding: '14px 18px',
+                      background: 'var(--bg-1)',
+                      borderRadius: 'var(--radius-lg)',
+                      color: 'var(--text-3)',
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 39 */
+                      fontSize: 13,
+                      border: '1px solid var(--border)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                    }}
+                  >
+                    <Spin size="small" />
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                      Thinking
+                    </span>
+                  </div>
+                </div>
+              )}
+              <div ref={endRef} />
+            </div>
+          )}
+        </div>
+        <div
+          style={{
+            padding: '16px 28px',
+            borderTop: '1px solid var(--border)',
+            background: 'var(--bg-1)',
+          }}
+        >
+          <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+            <Input.TextArea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="输入问题，Ctrl+Enter 发送"
+              disabled={loading}
+              autoSize={{ minRows: 1, maxRows: 4 }}
+              style={{ flex: 1, resize: 'none' }}
+            />
+            <Button
+              type="primary"
+              icon={<SendOutlined />}
+              onClick={handleSend}
+              loading={loading}
+              disabled={!input.trim() || loading}
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+export default SmartQA;
+// ============================================================
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 40 */
+// File: pages/ContentGeneration.tsx
+// ============================================================
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Select, Input, Button, Spin, Collapse, Table, Tag, Empty,
+} from 'antd';
+import {
+  FileTextOutlined, CopyOutlined, SettingOutlined, ThunderboltOutlined,
+  CheckCircleOutlined, ClockCircleOutlined, FieldTimeOutlined,
+  BarChartOutlined,
+} from '@ant-design/icons';
+import ReactMarkdown from 'react-markdown';
+import { api, getErrorMessage } from '../services/api';
+import apiClient from '../services/api';
+import gsap from 'gsap';
+import { ANIM_CONFIG } from '../config/animation';
+import { useAntdMessage } from '../utils/hooks';
+const DEFAULT_CONTENT_TYPES = [
+  { value: 'threat_report', label: '威胁报告' },
+  { value: 'intelligence_summary', label: '情报摘要' },
+  { value: 'cheating_analysis', label: '作弊场景分析' },
+  { value: 'criminal_pattern', label: '作恶模式报告' },
+  { value: 'tech_chain_analysis', label: '技术链路分析' },
+  { value: 'alert_notice', label: '预警通知' },
+];
+const normalizeContentTypes = (types: unknown): Array<{value: string; label: string}> => {
+  if (!Array.isArray(types)) return DEFAULT_CONTENT_TYPES;
+  return types.map((t: any) => {
+    if (typeof t === 'string') return { value: t, label: t };
+    if (t && typeof t === 'object') return { value: String(t.value || t.id || ''), label: String(t.label || t.name || t.value || '') };
+    return { value: String(t), label: String(t) };
+  });
+};
+const INDUSTRY_OPTIONS = [
+  { value: 'smart_manufacturing', label: '智能制造' },
+  { value: 'smart_education', label: '智慧教育' },
+  { value: 'healthcare', label: '医疗健康' },
+  { value: 'financial_services', label: '金融服务' },
+];
+const KPI_CARDS = [
+  { key: 'today', label: '今日生成', icon: <BarChartOutlined style={{ fontSize: 20 }} />, color: 'var(--blue)' },
+  { key: 'pending', label: '待审核', icon: <ClockCircleOutlined style={{ fontSize: 20 }} />, color: 'var(--yellow)' },
+  { key: 'approved', label: '已通过', icon: <CheckCircleOutlined style={{ fontSize: 20 }} />, color: 'var(--green)' },
+  { key: 'avg_time', label: '平均生成时间', icon: <FieldTimeOutlined style={{ fontSize: 20 }} />, color: 'var(--primary)' },
+];
+const CountUpNumber: React.FC<{ value: number; style?: React.CSSProperties }> = ({ value, style }) => {
+  const counterRef = useRef({ val: 0 });
+  const [display, setDisplay] = useState(0);
+  const hasAnimated = useRef(false);
+  useEffect(() => {
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 41 */
+    if (!hasAnimated.current) {
+      hasAnimated.current = true;
+      counterRef.current.val = 0;
+      setDisplay(0);
+      const tween = gsap.to(counterRef.current, {
+        val: value,
+        duration: ANIM_CONFIG.statCard.counterDuration,
+        ease: 'power2.out',
+        onUpdate: () => { setDisplay(Math.round(counterRef.current.val)); },
+        onComplete: () => { setDisplay(value); },
+      });
+      return () => { tween.kill(); };
+    } else {
+      const tween = gsap.to(counterRef.current, {
+        val: value,
+        duration: 0.6,
+        ease: 'power2.out',
+        onUpdate: () => { setDisplay(Math.round(counterRef.current.val)); },
+        onComplete: () => { setDisplay(value); },
+      });
+      return () => { tween.kill(); };
+    }
+  }, [value]);
+  return <div style={style}>{display}</div>;
+};
+const ContentGeneration: React.FC = () => {
+  const message = useAntdMessage();
+  const [contentType, setContentType] = useState('threat_report');
+  const [topic, setTopic] = useState('');
+  const [reference, setReference] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [result, setResult] = useState('');
+  const [contents, setContents] = useState<Record<string, unknown>[]>([]);
+  const [listLoading, setListLoading] = useState(true);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [model, setModel] = useState('deepseek-chat');
+  const [temperature, setTemperature] = useState(0.7);
+  const [maxLength, setMaxLength] = useState(4096);
+  const [industry, setIndustry] = useState<string | undefined>(undefined);
+  const [contentTypes, setContentTypes] = useState(DEFAULT_CONTENT_TYPES);
+  const [kpiStats, setKpiStats] = useState<Record<string, unknown>>({});
+  const fetchContents = async () => {
+    setListLoading(true);
+    try {
+      const res = await api.contentGen.list();
+      const d = res as Record<string, unknown>;
+      const items = (d?.items || d?.data || []) as Record<string, unknown>[];
+      setContents(items);
+      const total = items.length;
+      const pending = items.filter((i: Record<string, unknown>) => {
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 42 */
+        const s = String(i.status || '');
+        return s === 'pending' || s === 'PENDING' || s === 'generating' || s === 'GENERATING';
+      }).length;
+      const approved = items.filter((i: Record<string, unknown>) => {
+        const s = String(i.status || '');
+        return s === 'completed' || s === 'COMPLETED' || s === 'approved' || s === 'APPROVED';
+      }).length;
+      setKpiStats({
+        today: total,
+        pending,
+        approved,
+        avg_time: '12s',
+      });
+    } catch { setContents([]); } finally { setListLoading(false); }
+  };
+  const fetchIndustries = async () => {
+    try {
+      const res = await apiClient.get('/industry-scene/industries');
+      const d = res.data as Record<string, unknown>;
+      const list = (d?.industries || d?.items || d?.data || []) as Array<Record<string, unknown>>;
+      if (list.length > 0) {
+        const mapped = list.map((item) => ({
+          value: String(item.value || item.id || item.key || item.code || ''),
+          label: String(item.label || item.name || item.value || ''),
+          content_types: Array.isArray(item.content_types) ? item.content_types : undefined,
+        }));
+        if (mapped.length > 0 && !industry) {
+          setIndustry(mapped[0].value);
+          if (mapped[0].content_types && mapped[0].content_types.length > 0) {
+            setContentTypes(normalizeContentTypes(mapped[0].content_types));
+          }
+        }
+      }
+    } catch {}
+  };
+  const handleIndustryChange = async (value: string) => {
+    setIndustry(value);
+    try {
+      const res = await apiClient.get('/industry-scene/industries');
+      const d = res.data as Record<string, unknown>;
+      const list = (d?.industries || d?.items || d?.data || []) as Array<Record<string, unknown>>;
+      const found = list.find((item) =>
+        String(item.value || item.id || item.key || item.code || '') === value
+      );
+      if (found && Array.isArray(found.content_types) && found.content_types.length > 0) {
+        const normalized = normalizeContentTypes(found.content_types);
+        setContentTypes(normalized);
+        setContentType(normalized[0]?.value || 'threat_report');
+      } else {
+        setContentTypes(DEFAULT_CONTENT_TYPES);
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 43 */
+        setContentType('threat_report');
+      }
+    } catch {
+      setContentTypes(DEFAULT_CONTENT_TYPES);
+      setContentType('threat_report');
+    }
+  };
+  useEffect(() => { fetchContents(); fetchIndustries(); }, []);
+  const handleGenerate = async () => {
+    if (!contentType) { message.warning('请选择内容类型'); return; }
+    if (!topic.trim()) { message.warning('请输入主题'); return; }
+    setGenerating(true);
+    setResult('');
+    try {
+      const res = await api.contentGen.generate({
+        type: contentType,
+        topic,
+        reference: reference || undefined,
+        model,
+        temperature,
+        max_length: maxLength,
+        industry,
+      });
+      const d = res as Record<string, unknown>;
+      const extractStr = (v: unknown): string => {
+        if (typeof v === 'string') return v;
+        if (v && typeof v === 'object') {
+          const o = v as Record<string, unknown>;
+          return String(o.text || o.content || o.message || o.response || o.output || '');
+        }
+        return '';
+      };
+      const generated = extractStr(d.content) || extractStr(d.result) || extractStr(d.text) || extractStr(d.generated_content) || extractStr(d.output) || extractStr(d.generated_text) || extractStr(d.response) || '';
+      setResult(generated);
+      message.success('内容生成完成');
+      fetchContents();
+    } catch (err) { message.error(getErrorMessage(err)); } finally { setGenerating(false); }
+  };
+  const handleCopy = () => {
+    if (!result) return;
+    navigator.clipboard.writeText(result).then(() => message.success('已复制到剪贴板')).catch(() => message.error('复制失败'));
+  };
+  const columns = [
+    { title: '标题', dataIndex: 'title', key: 'title', ellipsis: true, render: (text: string) => <span style={{ color: 'var(--text-0)', fontWeight: 500 }}>{text || '—'}</span> },
+    { title: '类型', dataIndex: 'type', key: 'type', width: 130, render: (type: string) => { const t = contentTypes.find(c => c.value === type); return <Tag style={{ background: 'var(--blue-dim)', color: 'var(--blue)', border: 'none' }}>{t?.label || type}</Tag>; } },
+    { title: '状态', dataIndex: 'status', key: 'status', width: 90, render: (status: string) => {
+      const isComplete = status === 'completed' || status === 'COMPLETED' || status === 'approved' || status === 'APPROVED';
+      const isPending = status === 'pending' || status === 'PENDING';
+      if (isComplete) return <Tag style={{ background: 'var(--green-dim)', color: 'var(--green)', border: 'none' }}>已通过</Tag>;
+      if (isPending) return <Tag style={{ background: 'var(--yellow-dim)', color: 'var(--yellow)', border: 'none' }}>待审核</Tag>;
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 44 */
+      return <Tag style={{ background: 'var(--blue-dim)', color: 'var(--blue)', border: 'none' }}>生成中</Tag>;
+    }},
+    { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 140, render: (text: string) => <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-3)', fontSize: 12 }}>{text ? String(text).slice(0, 10) : '—'}</span> },
+  ];
+  const getKpiValue = (key: string) => {
+    if (key === 'avg_time') return String(kpiStats.avg_time || '—');
+    return Number(kpiStats[key] || 0);
+  };
+  return (
+    <div style={{ padding: 32, background: 'var(--bg-0)', minHeight: '100vh', overflowX: 'hidden' }}>
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontSize: 28, fontWeight: 700, fontFamily: 'var(--font-body)', color: 'var(--text-0)', margin: 0, letterSpacing: '-0.02em' }}>内容生成</h1>
+        <p style={{ fontSize: 14, color: 'var(--text-2)', margin: '8px 0 0', fontFamily: 'var(--font-body)' }}>基于大模型的黑灰产情报内容自动生成，支持威胁报告、作恶模式分析、技术链路还原等场景</p>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 24 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-1)', whiteSpace: 'nowrap' }}>行业场景</div>
+        <Select
+          value={industry}
+          onChange={handleIndustryChange}
+          style={{ width: 220 }}
+          options={INDUSTRY_OPTIONS}
+          placeholder="选择行业场景"
+        />
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }}>
+        {KPI_CARDS.map((card, idx) => (
+          <div
+            key={card.key}
+            style={{
+              background: 'var(--bg-1)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-lg)',
+              padding: 20,
+              transition: 'all 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94)',
+              cursor: 'default',
+              opacity: 0,
+              transform: 'translateY(12px)',
+            }}
+            ref={(el) => { if (el) { gsap.fromTo(el, { y: 12, opacity: 0 }, { y: 0, opacity: 1, duration: 0.4, delay: idx * 0.08, ease: 'power2.out', clearProps: 'opacity,y' }); } }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'translateY(-2px)';
+              e.currentTarget.style.boxShadow = '0 8px 24px rgba(0,0,0,0.08)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'translateY(0)';
+              e.currentTarget.style.boxShadow = 'none';
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+              <span style={{ color: card.color }}>{card.icon}</span>
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 45 */
+              <span style={{ fontSize: 12, color: 'var(--text-2)', fontWeight: 500 }}>{card.label}</span>
+            </div>
+            {typeof getKpiValue(card.key) === 'number' ? <CountUpNumber value={getKpiValue(card.key) as number} style={{ fontFamily: 'var(--font-mono)', color: card.color, fontWeight: 700, fontSize: 24, lineHeight: 1 }} /> : <div style={{ fontFamily: 'var(--font-mono)', color: card.color, fontWeight: 700, fontSize: 24, lineHeight: 1 }}>{getKpiValue(card.key)}</div>}
+          </div>
+        ))}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, marginBottom: 24 }}>
+        <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 24 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-0)', marginBottom: 20, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <FileTextOutlined style={{ color: 'var(--primary)' }} /> 生成配置
+          </div>
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 6 }}>内容类型</div>
+            <Select value={contentType} onChange={setContentType} style={{ width: '100%' }} options={contentTypes} />
+          </div>
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 6 }}>主题</div>
+            <Input value={topic} onChange={(e) => setTopic(e.target.value)} placeholder="例如: 近期网络赌博平台资金链路分析" />
+          </div>
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 6 }}>参考内容</div>
+            <Input.TextArea value={reference} onChange={(e) => setReference(e.target.value)} rows={4} placeholder="可选：提供相关黑话、链接、账号等情报参考" style={{ resize: 'vertical' }} />
+          </div>
+          <Collapse
+            activeKey={advancedOpen ? ['adv'] : []}
+            onChange={(keys) => setAdvancedOpen(keys.includes('adv'))}
+            items={[{
+              key: 'adv',
+              label: <span style={{ fontSize: 12, color: 'var(--text-2)' }}><SettingOutlined style={{ marginRight: 4 }} />高级选项</span>,
+              children: (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 6 }}>模型</div>
+                    <Select value={model} onChange={setModel} style={{ width: '100%' }} options={[{ value: 'deepseek-chat', label: 'DeepSeek Chat' }, { value: 'deepseek-coder', label: 'DeepSeek Coder' }, { value: 'gpt-4', label: 'GPT-4' }]} />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 6 }}>温度: {temperature}</div>
+                    <input type="range" min={0} max={2} step={0.1} value={temperature} onChange={(e) => setTemperature(Number(e.target.value))} style={{ width: '100%' }} />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 6 }}>最大长度</div>
+                    <Input type="number" value={maxLength} onChange={(e) => setMaxLength(Number(e.target.value))} min={256} max={8192} />
+                  </div>
+                </div>
+              ),
+            }]}
+          />
+          <Button type="primary" icon={<ThunderboltOutlined />} onClick={handleGenerate} loading={generating} disabled={!topic.trim()} block style={{ marginTop: 16 }}>生成内容</Button>
+        </div>
+        <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 24, display: 'flex', flexDirection: 'column' }}>
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 46 */
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+            <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-0)' }}>生成结果</span>
+            {result && <Button size="small" icon={<CopyOutlined />} onClick={handleCopy}>复制</Button>}
+          </div>
+          <div style={{ flex: 1, overflow: 'auto', minHeight: 300 }}>
+            {generating ? (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 12 }}>
+                <Spin size="large" />
+                <span style={{ color: 'var(--text-3)', fontSize: 13 }}>正在生成内容...</span>
+              </div>
+            ) : result ? (
+              <div style={{ fontSize: 14, lineHeight: 1.8, color: 'var(--text-1)' }} className="markdown-body">
+                <ReactMarkdown>{result}</ReactMarkdown>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 8 }}>
+                <FileTextOutlined style={{ fontSize: 40, color: 'var(--text-3)' }} />
+                <span style={{ color: 'var(--text-3)', fontSize: 13 }}>输入主题并点击生成，结果将在此显示</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="chart-reveal chart-d-1">
+        <Collapse
+          defaultActiveKey={[]}
+          items={[{
+            key: 'contents',
+            label: <span style={{ fontWeight: 600, color: 'var(--text-0)' }}>内容管理</span>,
+            children: listLoading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}><Spin /></div> : contents.length === 0 ? <Empty description={<span style={{ color: 'var(--text-3)' }}>暂无生成记录</span>} /> : <Table dataSource={contents} columns={columns} rowKey={(record) => String(record.id || Math.random())} pagination={{ pageSize: 10, showSizeChanger: false }} loading={listLoading} />,
+          }]}
+        />
+      </div>
+    </div>
+  );
+};
+export default ContentGeneration;
+// ============================================================
+// File: pages/IndustryScene.tsx
+// ============================================================
+import React, { useState, useEffect } from 'react';
+import {
+  Card, Tag, Button, Descriptions, Spin, Empty, Space, Slider, Switch, Input, Select, Divider,
+} from 'antd';
+import {
+  ToolOutlined, ReadOutlined, HeartOutlined, DollarOutlined,
+  ThunderboltOutlined, TranslationOutlined, FileTextOutlined,
+  QuestionCircleOutlined, SettingOutlined, CheckCircleOutlined,
+  SafetyCertificateOutlined, BugOutlined, AlertOutlined,
+  LockOutlined, BankOutlined, RobotOutlined,
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 47 */
+} from '@ant-design/icons';
+import apiClient from '../services/api';
+import { getErrorMessage } from '../services/api';
+import { useAntdMessage } from '../utils/hooks';
+const INDUSTRY_META: Record<string, {
+  icon: React.ReactNode;
+  color: string;
+  bgColor: string;
+  label: string;
+  description: string;
+  defaultFocusAreas: string[];
+  defaultTerms: Array<{ term: string; meaning: string; category: string }>;
+  defaultConfig: Record<string, unknown>;
+}> = {
+  smart_manufacturing: {
+    icon: <ToolOutlined style={{ fontSize: 28 }} />,
+    color: '#2563EB',
+    bgColor: '#2563EB15',
+    label: '智能制造',
+    description: '聚焦工业控制系统安全、供应链攻击、OT/IT融合威胁',
+    defaultFocusAreas: ['工控系统漏洞', '供应链攻击', 'OT/IT融合威胁', '勒索软件', '工业间谍', 'PLC攻击'],
+    defaultTerms: [
+      { term: '肉鸡', meaning: '被控制的工控设备', category: '控制术语' },
+      { term: '洗料', meaning: '篡改生产配方数据', category: '生产术语' },
+      { term: '挂马', meaning: '在SCADA系统中植入后门', category: '攻击术语' },
+      { term: '社工', meaning: '针对运维人员的社会工程', category: '攻击术语' },
+      { term: '提权', meaning: '获取PLC控制权限', category: '攻击术语' },
+      { term: '脱裤', meaning: '窃取生产数据库', category: '数据术语' },
+    ],
+    defaultConfig: {
+      analysis_depth: 'deep',
+      enable_ot_monitoring: true,
+      supply_chain_scan_interval: 24,
+      threat_score_threshold: 0.7,
+      enable_iot_detection: true,
+      max_analysis_concurrency: 5,
+    },
+  },
+  smart_education: {
+    icon: <ReadOutlined style={{ fontSize: 28 }} />,
+    color: '#16A34A',
+    bgColor: '#16A34A15',
+    label: '智慧教育',
+    description: '聚焦学术数据泄露、在线教育平台攻击、学生隐私威胁',
+    defaultFocusAreas: ['数据泄露', '在线平台攻击', '学术造假', '隐私窃取', '钓鱼攻击', '考试作弊黑产'],
+    defaultTerms: [
+      { term: '代写', meaning: '论文/作业代写黑产', category: '学术术语' },
+      { term: '代考', meaning: '考试替考黑产', category: '学术术语' },
+      { term: '查重', meaning: '论文查重绕过服务', category: '学术术语' },
+      { term: '挂科包过', meaning: '课程成绩篡改服务', category: '学术术语' },
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 48 */
+      { term: '社工库', meaning: '学生信息泄露数据库', category: '数据术语' },
+      { term: '撞库', meaning: '利用泄露凭证批量登录', category: '攻击术语' },
+    ],
+    defaultConfig: {
+      analysis_depth: 'standard',
+      enable_platform_monitoring: true,
+      data_leak_scan_interval: 12,
+      threat_score_threshold: 0.6,
+      enable_privacy_detection: true,
+      max_analysis_concurrency: 8,
+    },
+  },
+  healthcare: {
+    icon: <HeartOutlined style={{ fontSize: 28 }} />,
+    color: '#DC2626',
+    bgColor: '#DC262615',
+    label: '医疗健康',
+    description: '聚焦医疗设备安全、患者数据泄露、医药供应链威胁',
+    defaultFocusAreas: ['医疗设备漏洞', '患者数据泄露', '医药造假', '远程医疗攻击', '勒索软件', '处方药黑市'],
+    defaultTerms: [
+      { term: '号贩子', meaning: '倒卖专家号源的黑产', category: '医疗术语' },
+      { term: '假药', meaning: '仿冒药品黑产链', category: '医药术语' },
+      { term: '医保套现', meaning: '医保卡非法套现', category: '金融术语' },
+      { term: '病历倒卖', meaning: '患者病历信息贩卖', category: '数据术语' },
+      { term: '处方外流', meaning: '处方药非法流通', category: '医药术语' },
+      { term: '医托', meaning: '医疗诈骗引流', category: '诈骗术语' },
+    ],
+    defaultConfig: {
+      analysis_depth: 'deep',
+      enable_device_monitoring: true,
+      data_leak_scan_interval: 6,
+      threat_score_threshold: 0.8,
+      enable_hipaa_compliance: true,
+      max_analysis_concurrency: 4,
+    },
+  },
+  financial_services: {
+    icon: <DollarOutlined style={{ fontSize: 28 }} />,
+    color: '#7C3AED',
+    bgColor: '#7C3AED15',
+    label: '金融服务',
+    description: '聚焦金融诈骗、洗钱活动、支付安全、信贷欺诈威胁',
+    defaultFocusAreas: ['金融诈骗', '洗钱活动', '支付安全', '信贷欺诈', '内鬼威胁', '加密货币犯罪'],
+    defaultTerms: [
+      { term: '杀猪盘', meaning: '长期感情投资型诈骗', category: '诈骗术语' },
+      { term: '跑分', meaning: '利用第三方支付洗钱', category: '洗钱术语' },
+      { term: '四件套', meaning: '银行卡+U盾+身份证+手机卡', category: '工具术语' },
+      { term: '料子', meaning: '窃取的银行卡信息', category: '数据术语' },
+      { term: '水房', meaning: '洗钱资金转移通道', category: '洗钱术语' },
+      { term: '接码', meaning: '验证码接收服务', category: '工具术语' },
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 49 */
+    ],
+    defaultConfig: {
+      analysis_depth: 'comprehensive',
+      enable_transaction_monitoring: true,
+      fraud_scan_interval: 1,
+      threat_score_threshold: 0.9,
+      enable_aml_detection: true,
+      max_analysis_concurrency: 10,
+    },
+  },
+};
+const INDUSTRY_KEYS = ['smart_manufacturing', 'smart_education', 'healthcare', 'financial_services'];
+const FOCUS_AREA_COLORS: Record<string, string> = {
+  '工控系统漏洞': '#2563EB', '供应链攻击': '#2563EB', 'OT/IT融合威胁': '#2563EB',
+  '勒索软件': '#DC2626', '工业间谍': '#EA580C', 'PLC攻击': '#7C3AED',
+  '数据泄露': '#DC2626', '在线平台攻击': '#EA580C', '学术造假': '#7C3AED',
+  '隐私窃取': '#DC2626', '钓鱼攻击': '#0D9488', '考试作弊黑产': '#7C3AED',
+  '医疗设备漏洞': '#DC2626', '患者数据泄露': '#2563EB', '医药造假': '#EA580C',
+  '远程医疗攻击': '#0D9488', '处方药黑市': '#7C3AED',
+  '金融诈骗': '#DC2626', '洗钱活动': '#EA580C', '支付安全': '#2563EB',
+  '信贷欺诈': '#7C3AED', '内鬼威胁': '#0D9488', '加密货币犯罪': '#7C3AED',
+};
+const TERM_CATEGORY_COLORS: Record<string, { bg: string; color: string }> = {
+  '控制术语': { bg: '#2563EB15', color: '#2563EB' },
+  '生产术语': { bg: '#16A34A15', color: '#16A34A' },
+  '攻击术语': { bg: '#DC262615', color: '#DC2626' },
+  '数据术语': { bg: '#7C3AED15', color: '#7C3AED' },
+  '学术术语': { bg: '#16A34A15', color: '#16A34A' },
+  '医疗术语': { bg: '#DC262615', color: '#DC2626' },
+  '医药术语': { bg: '#0D948815', color: '#0D9488' },
+  '金融术语': { bg: '#7C3AED15', color: '#7C3AED' },
+  '诈骗术语': { bg: '#DC262615', color: '#DC2626' },
+  '洗钱术语': { bg: '#EA580C15', color: '#EA580C' },
+  '工具术语': { bg: '#2563EB15', color: '#2563EB' },
+};
+const IndustryScene: React.FC = () => {
+  const message = useAntdMessage();
+  const [industries, setIndustries] = useState<Array<Record<string, unknown>>>([]);
+  const [industriesLoading, setIndustriesLoading] = useState(true);
+  const [selectedIndustry, setSelectedIndustry] = useState<string | null>(null);
+  const [strategy, setStrategy] = useState<Record<string, unknown> | null>(null);
+  const [config, setConfig] = useState<Record<string, unknown> | null>(null);
+  const [strategyLoading, setStrategyLoading] = useState(false);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [editedConfig, setEditedConfig] = useState<Record<string, unknown>>({});
+  const [saving, setSaving] = useState(false);
+  const fetchIndustries = async () => {
+    setIndustriesLoading(true);
+    try {
+      const res = await apiClient.get('/industry-scene/industries');
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 50 */
+      const d = res.data as Record<string, unknown>;
+      const list = (d?.industries || d?.items || d?.data || []) as Array<Record<string, unknown>>;
+      setIndustries(list);
+      if (list.length > 0 && !selectedIndustry) {
+        const firstId = String(list[0].value || list[0].id || list[0].key || list[0].code || INDUSTRY_KEYS[0]);
+        setSelectedIndustry(firstId);
+      }
+    } catch {
+      setIndustries([]);
+      if (!selectedIndustry) {
+        setSelectedIndustry(INDUSTRY_KEYS[0]);
+      }
+    } finally {
+      setIndustriesLoading(false);
+    }
+  };
+  const fetchStrategy = async (industryId: string) => {
+    setStrategyLoading(true);
+    try {
+      const res = await apiClient.get(`/industry-scene/industries/${industryId}/strategy`);
+      const d = res.data as Record<string, unknown>;
+      setStrategy(d);
+    } catch {
+      setStrategy(null);
+    } finally {
+      setStrategyLoading(false);
+    }
+  };
+  const fetchConfig = async (industryId: string) => {
+    setConfigLoading(true);
+    try {
+      const res = await apiClient.get(`/industry-scene/industries/${industryId}/config`);
+      const d = res.data as Record<string, unknown>;
+      setConfig(d);
+      setEditedConfig((d?.config || d || {}) as Record<string, unknown>);
+    } catch {
+      setConfig(null);
+      const meta = INDUSTRY_META[industryId];
+      setEditedConfig(meta?.defaultConfig || {});
+    } finally {
+      setConfigLoading(false);
+    }
+  };
+  useEffect(() => {
+    fetchIndustries();
+  }, []);
+  useEffect(() => {
+    if (selectedIndustry) {
+      fetchStrategy(selectedIndustry);
+      fetchConfig(selectedIndustry);
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 51 */
+    }
+  }, [selectedIndustry]);
+  const handleSelectIndustry = (key: string) => {
+    if (key !== selectedIndustry) {
+      setSelectedIndustry(key);
+    }
+  };
+  const handleSaveConfig = async () => {
+    if (!selectedIndustry) return;
+    setSaving(true);
+    try {
+      await apiClient.put(`/industry-scene/industries/${selectedIndustry}/config`, editedConfig);
+      message.success('配置已保存');
+    } catch (err) {
+      message.error(getErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const handleQuickAction = (action: string) => {
+    if (!selectedIndustry) return;
+    const meta = INDUSTRY_META[selectedIndustry];
+    const label = meta?.label || selectedIndustry;
+    switch (action) {
+      case 'qa':
+        message.info(`已切换智能问答至「${label}」行业上下文`);
+        break;
+      case 'translation':
+        message.info(`已切换自动翻译至「${label}」行业术语库`);
+        break;
+      case 'content-gen':
+        message.info(`已切换内容生成至「${label}」行业模板`);
+        break;
+    }
+  };
+  const getFocusAreas = (): string[] => {
+    if (strategy?.focus_areas) {
+      return (strategy.focus_areas as string[]);
+    }
+    if (strategy?.threat_categories) {
+      return (strategy.threat_categories as string[]);
+    }
+    return INDUSTRY_META[selectedIndustry || '']?.defaultFocusAreas || [];
+  };
+  const getTerms = (): Array<{ term: string; meaning: string; category: string }> => {
+    if (strategy?.terms) {
+      const raw = strategy.terms;
+      if (Array.isArray(raw)) {
+        return raw.map((t: unknown) => {
+          if (typeof t === 'object' && t !== null) {
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 52 */
+            const obj = t as Record<string, unknown>;
+            return {
+              term: String(obj.term || obj.source_term || obj.name || ''),
+              meaning: String(obj.meaning || obj.target_term || obj.definition || obj.description || ''),
+              category: String(obj.category || obj.type || '行业术语'),
+            };
+          }
+          return { term: String(t), meaning: '', category: '行业术语' };
+        });
+      }
+      if (typeof raw === 'object') {
+        return Object.entries(raw as Record<string, unknown>).map(([key, val]) => ({
+          term: key,
+          meaning: String(val || ''),
+          category: '行业术语',
+        }));
+      }
+    }
+    if (strategy?.translation_terms) {
+      const raw = strategy.translation_terms;
+      if (typeof raw === 'object' && !Array.isArray(raw)) {
+        return Object.entries(raw as Record<string, unknown>).map(([key, val]) => ({
+          term: key,
+          meaning: String(val || ''),
+          category: '行业术语',
+        }));
+      }
+    }
+    return INDUSTRY_META[selectedIndustry || '']?.defaultTerms || [];
+  };
+  const getActiveConfig = (): Record<string, unknown> => {
+    if (Object.keys(editedConfig).length > 0) return editedConfig;
+    if (config?.config) return config.config as Record<string, unknown>;
+    return INDUSTRY_META[selectedIndustry || '']?.defaultConfig || {};
+  };
+  const meta = selectedIndustry ? INDUSTRY_META[selectedIndustry] : null;
+  const focusAreas = getFocusAreas();
+  const terms = getTerms();
+  const activeConfig = getActiveConfig();
+  return (
+    <div style={{ padding: 32, background: 'var(--bg-0)', minHeight: '100vh', overflowX: 'hidden' }}>
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontSize: 28, fontWeight: 700, fontFamily: 'var(--font-body)', color: 'var(--text-0)', margin: 0, letterSpacing: '-0.02em' }}>
+          行业场景
+        </h1>
+        <p style={{ fontSize: 14, color: 'var(--text-2)', margin: '8px 0 0', fontFamily: 'var(--font-body)' }}>
+          针对不同行业场景定制威胁分析策略、行业术语库和分析配置，提升情报分析精准度
+        </p>
+      </div>
+      <Spin spinning={industriesLoading}>
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 53 */
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 28 }}>
+          {INDUSTRY_KEYS.map((key) => {
+          const m = INDUSTRY_META[key];
+          const isActive = selectedIndustry === key;
+          return (
+            <Card
+              key={key}
+              hoverable
+              onClick={() => handleSelectIndustry(key)}
+              style={{
+                background: isActive ? m.bgColor : 'var(--bg-1)',
+                border: isActive ? `2px solid ${m.color}` : '1px solid var(--border)',
+                borderRadius: 12,
+                cursor: 'pointer',
+                transition: 'all 0.25s cubic-bezier(0.25, 0.46, 0.45, 0.94)',
+                transform: isActive ? 'translateY(-2px)' : 'none',
+                boxShadow: isActive ? `0 8px 24px ${m.color}20` : 'none',
+              }}
+              styles={{ body: { padding: 20 } }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+                <div
+                  style={{
+                    width: 48,
+                    height: 48,
+                    borderRadius: 12,
+                    background: isActive ? `${m.color}20` : 'var(--bg-2)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: isActive ? m.color : 'var(--text-2)',
+                    transition: 'all 0.25s',
+                  }}
+                >
+                  {m.icon}
+                </div>
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: isActive ? m.color : 'var(--text-0)', fontFamily: 'var(--font-body)' }}>
+                    {m.label}
+                  </div>
+                  {isActive && (
+                    <Tag style={{ background: `${m.color}20`, color: m.color, border: 'none', fontSize: 11, marginTop: 2, padding: '0 6px' }}>
+                      当前
+                    </Tag>
+                  )}
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
+                {m.description}
+              </div>
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 54 */
+            </Card>
+          );
+        })}
+      </div>
+      </Spin>
+      {selectedIndustry && meta && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+            <div
+              style={{
+                background: 'var(--bg-1)',
+                border: '1px solid var(--border)',
+                borderRadius: 12,
+                padding: 24,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20 }}>
+                <AlertOutlined style={{ fontSize: 16, color: meta.color }} />
+                <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-0)' }}>威胁关注领域</span>
+                <Tag style={{ background: `${meta.color}15`, color: meta.color, border: 'none', marginLeft: 'auto' }}>
+                  {focusAreas.length} 项
+                </Tag>
+              </div>
+              {strategyLoading ? (
+                <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div>
+              ) : focusAreas.length === 0 ? (
+                <Empty description={<span style={{ color: 'var(--text-3)' }}>暂无威胁关注领域</span>} />
+              ) : (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {focusAreas.map((area) => {
+                    const c = FOCUS_AREA_COLORS[area] || meta.color;
+                    return (
+                      <Tag
+                        key={area}
+                        style={{
+                          background: `${c}12`,
+                          color: c,
+                          border: `1px solid ${c}30`,
+                          borderRadius: 6,
+                          padding: '4px 12px',
+                          fontSize: 13,
+                          fontWeight: 500,
+                        }}
+                      >
+                        {area}
+                      </Tag>
+                    );
+                  })}
+                </div>
+              )}
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 55 */
+            </div>
+            <div
+              style={{
+                background: 'var(--bg-1)',
+                border: '1px solid var(--border)',
+                borderRadius: 12,
+                padding: 24,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20 }}>
+                <BugOutlined style={{ fontSize: 16, color: meta.color }} />
+                <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-0)' }}>行业术语与黑话</span>
+                <Tag style={{ background: `${meta.color}15`, color: meta.color, border: 'none', marginLeft: 'auto' }}>
+                  {terms.length} 条
+                </Tag>
+              </div>
+              {strategyLoading ? (
+                <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div>
+              ) : terms.length === 0 ? (
+                <Empty description={<span style={{ color: 'var(--text-3)' }}>暂无行业术语</span>} />
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 280, overflowY: 'auto' }}>
+                  {terms.map((t, i) => {
+                    const catStyle = TERM_CATEGORY_COLORS[t.category] || { bg: `${meta.color}15`, color: meta.color };
+                    return (
+                      <div
+                        key={i}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 10,
+                          padding: '8px 12px',
+                          background: 'var(--bg-0)',
+                          borderRadius: 8,
+                          border: '1px solid var(--border)',
+                        }}
+                      >
+                        <span style={{ fontWeight: 600, color: 'var(--text-0)', fontSize: 13, minWidth: 60 }}>{t.term}</span>
+                        <span style={{ color: 'var(--text-2)', fontSize: 12, flex: 1 }}>{t.meaning}</span>
+                        <Tag style={{ background: catStyle.bg, color: catStyle.color, border: 'none', fontSize: 11, flexShrink: 0 }}>
+                          {t.category}
+                        </Tag>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+          <div
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 56 */
+            style={{
+              background: 'var(--bg-1)',
+              border: '1px solid var(--border)',
+              borderRadius: 12,
+              padding: 24,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20 }}>
+              <SettingOutlined style={{ fontSize: 16, color: meta.color }} />
+              <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-0)' }}>行业分析配置</span>
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+                <Button
+                  size="small"
+                  onClick={() => {
+                    const defaultCfg = INDUSTRY_META[selectedIndustry]?.defaultConfig || {};
+                    setEditedConfig(defaultCfg);
+                  }}
+                >
+                  恢复默认
+                </Button>
+                <Button
+                  type="primary"
+                  size="small"
+                  icon={<CheckCircleOutlined />}
+                  loading={saving}
+                  onClick={handleSaveConfig}
+                >
+                  保存配置
+                </Button>
+              </div>
+            </div>
+            {configLoading ? (
+              <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div>
+            ) : (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 6 }}>分析深度</div>
+                    <Select
+                      value={String(editedConfig.analysis_depth || activeConfig.analysis_depth || 'standard')}
+                      onChange={(v) => setEditedConfig((prev) => ({ ...prev, analysis_depth: v }))}
+                      style={{ width: '100%' }}
+                      options={[
+                        { value: 'quick', label: '快速' },
+                        { value: 'standard', label: '标准' },
+                        { value: 'deep', label: '深度' },
+                        { value: 'comprehensive', label: '全面' },
+                      ]}
+                    />
+                  </div>
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 57 */
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)' }}>威胁评分阈值</span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: meta.color, fontWeight: 600 }}>
+                        {Number(editedConfig.threat_score_threshold ?? activeConfig.threat_score_threshold ?? 0.7).toFixed(2)}
+                      </span>
+                    </div>
+                    <Slider
+                      min={0}
+                      max={100}
+                      value={Math.round((Number(editedConfig.threat_score_threshold ?? activeConfig.threat_score_threshold ?? 0.7)) * 100)}
+                      onChange={(v) => setEditedConfig((prev) => ({ ...prev, threat_score_threshold: v / 100 }))}
+                    />
+                  </div>
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)' }}>最大分析并发数</span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--text-1)', fontWeight: 600 }}>
+                        {String(editedConfig.max_analysis_concurrency ?? activeConfig.max_analysis_concurrency ?? 5)}
+                      </span>
+                    </div>
+                    <Slider
+                      min={1}
+                      max={20}
+                      value={Number(editedConfig.max_analysis_concurrency ?? activeConfig.max_analysis_concurrency ?? 5)}
+                      onChange={(v) => setEditedConfig((prev) => ({ ...prev, max_analysis_concurrency: v }))}
+                    />
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 6 }}>扫描间隔（小时）</div>
+                    <Input
+                      type="number"
+                      value={String(editedConfig.supply_chain_scan_interval ?? editedConfig.data_leak_scan_interval ?? editedConfig.fraud_scan_interval ?? activeConfig.supply_chain_scan_interval ?? activeConfig.data_leak_scan_interval ?? activeConfig.fraud_scan_interval ?? 12)}
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        const key = selectedIndustry === 'smart_manufacturing' ? 'supply_chain_scan_interval'
+                          : selectedIndustry === 'financial_services' ? 'fraud_scan_interval'
+                          : 'data_leak_scan_interval';
+                        setEditedConfig((prev) => ({ ...prev, [key]: val }));
+                      }}
+                      style={{ width: '100%' }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    {[
+                      { key: 'enable_ot_monitoring', label: 'OT监控', industries: ['smart_manufacturing'] },
+                      { key: 'enable_iot_detection', label: 'IoT检测', industries: ['smart_manufacturing'] },
+                      { key: 'enable_platform_monitoring', label: '平台监控', industries: ['smart_education'] },
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 58 */
+                      { key: 'enable_privacy_detection', label: '隐私检测', industries: ['smart_education'] },
+                      { key: 'enable_device_monitoring', label: '设备监控', industries: ['healthcare'] },
+                      { key: 'enable_hipaa_compliance', label: 'HIPAA合规', industries: ['healthcare'] },
+                      { key: 'enable_transaction_monitoring', label: '交易监控', industries: ['financial_services'] },
+                      { key: 'enable_aml_detection', label: '反洗钱检测', industries: ['financial_services'] },
+                    ].filter((item) => item.industries.includes(selectedIndustry)).map((item) => (
+                      <div
+                        key={item.key}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          padding: '8px 12px',
+                          background: 'var(--bg-0)',
+                          borderRadius: 8,
+                          border: '1px solid var(--border)',
+                        }}
+                      >
+                        <span style={{ fontSize: 13, color: 'var(--text-1)' }}>{item.label}</span>
+                        <Switch
+                          size="small"
+                          checked={Boolean(editedConfig[item.key] ?? activeConfig[item.key] ?? true)}
+                          onChange={(v) => setEditedConfig((prev) => ({ ...prev, [item.key]: v }))}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+          <div
+            style={{
+              background: 'var(--bg-1)',
+              border: '1px solid var(--border)',
+              borderRadius: 12,
+              padding: 24,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20 }}>
+              <ThunderboltOutlined style={{ fontSize: 16, color: meta.color }} />
+              <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-0)' }}>快捷操作</span>
+              <span style={{ fontSize: 12, color: 'var(--text-3)', marginLeft: 4 }}>
+                将「{meta.label}」行业上下文应用到其他功能模块
+              </span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+              <Button
+                size="large"
+                icon={<QuestionCircleOutlined />}
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 59 */
+                onClick={() => handleQuickAction('qa')}
+                style={{
+                  height: 56,
+                  borderRadius: 10,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 8,
+                  background: 'var(--bg-0)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-0)',
+                  fontWeight: 500,
+                }}
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                  <RobotOutlined style={{ fontSize: 18, color: meta.color }} />
+                  <span style={{ fontSize: 12 }}>切换智能问答</span>
+                </div>
+              </Button>
+              <Button
+                size="large"
+                icon={<TranslationOutlined />}
+                onClick={() => handleQuickAction('translation')}
+                style={{
+                  height: 56,
+                  borderRadius: 10,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 8,
+                  background: 'var(--bg-0)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-0)',
+                  fontWeight: 500,
+                }}
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                  <TranslationOutlined style={{ fontSize: 18, color: meta.color }} />
+                  <span style={{ fontSize: 12 }}>切换自动翻译</span>
+                </div>
+              </Button>
+              <Button
+                size="large"
+                icon={<FileTextOutlined />}
+                onClick={() => handleQuickAction('content-gen')}
+                style={{
+                  height: 56,
+                  borderRadius: 10,
+                  display: 'flex',
+                  alignItems: 'center',
+/* 黑灰产情报智能问答与内容生成系统 V1.0 */
+/* Page 60 */
+                  justifyContent: 'center',
+                  gap: 8,
+                  background: 'var(--bg-0)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-0)',
+                  fontWeight: 500,
+                }}
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                  <FileTextOutlined style={{ fontSize: 18, color: meta.color }} />
+                  <span style={{ fontSize: 12 }}>切换内容生成</span>
+                </div>
+              </Button>
+            </div>
+          </div>
+          {strategy && Object.keys(strategy).length > 0 && (
+            <div
+              style={{
+                background: 'var(--bg-1)',
+                border: '1px solid var(--border)',
+                borderRadius: 12,
+                padding: 24,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20 }}>
+                <SafetyCertificateOutlined style={{ fontSize: 16, color: meta.color }} />
+                <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-0)' }}>策略详情</span>
+              </div>
+              <Descriptions
+                bordered
+                size="small"
+                column={2}
+                styles={{ label: { background: 'var(--bg-2)', color: 'var(--text-2)', fontSize: 12, fontWeight: 500 }, content: { background: 'var(--bg-1)', color: 'var(--text-0)', fontSize: 13 } }}
+              >
+                {Object.entries(strategy)
+                  .filter(([key]) => !['focus_areas', 'terms', 'translation_terms', 'threat_categories'].includes(key))
+                  .map(([key, value]) => (
+                    <Descriptions.Item key={key} label={key}>
+                      {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+                    </Descriptions.Item>
+                  ))}
+              </Descriptions>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+export default IndustryScene;

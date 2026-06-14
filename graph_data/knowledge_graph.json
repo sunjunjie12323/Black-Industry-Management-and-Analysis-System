@@ -1,0 +1,70 @@
+{
+  "entities": {
+    "b7284f66a80345d5ad9075ae11aa30ab": {
+      "id": "b7284f66a80345d5ad9075ae11aa30ab",
+      "type": "account",
+      "value": "TG:@showing",
+      "context": "从情报6c0f7770中提取",
+      "source_ids": [
+        "6c0f77705eb7420097bf8d59c65dd88b"
+      ],
+      "confidence": 0.75,
+      "first_seen": "2026-06-08 01:27:09.845996+00:00",
+      "last_seen": "2026-06-08 01:27:09.845996+00:00",
+      "metadata": {}
+    },
+    "733bb926d6e145158accb14584f076a9": {
+      "id": "733bb926d6e145158accb14584f076a9",
+      "type": "account",
+      "value": "passwords",
+      "context": "从情报6c0f7770中提取",
+      "source_ids": [
+        "6c0f77705eb7420097bf8d59c65dd88b"
+      ],
+      "confidence": 0.6,
+      "first_seen": "2026-06-08 01:27:09.845996+00:00",
+      "last_seen": "2026-06-08 01:27:09.845996+00:00",
+      "metadata": {}
+    },
+    "78f7c9950a354e2a8486ab879a70b0f4": {
+      "id": "78f7c9950a354e2a8486ab879a70b0f4",
+      "type": "tool",
+      "value": "DDoS",
+      "context": "分布式拒绝服务攻击工具",
+      "source_ids": [
+        "6a6bb3cb5f354dd3a8d2435bed6d8bd1"
+      ],
+      "confidence": 0.7,
+      "first_seen": "2026-06-08 01:29:56.263006",
+      "last_seen": "2026-06-13 09:43:52.327937+00:00",
+      "metadata": {}
+    }
+  },
+  "relations": {},
+  "nodes": {
+    "b7284f66a80345d5ad9075ae11aa30ab": {
+      "type": "account",
+      "value": "TG:@showing",
+      "confidence": 0.75,
+      "context": "从情报6c0f7770中提取"
+    },
+    "733bb926d6e145158accb14584f076a9": {
+      "type": "account",
+      "value": "passwords",
+      "confidence": 0.6,
+      "context": "从情报6c0f7770中提取"
+    },
+    "78f7c9950a354e2a8486ab879a70b0f4": {
+      "type": "tool",
+      "value": "DDoS",
+      "confidence": 0.7,
+      "context": "分布式拒绝服务攻击工具"
+    }
+  },
+  "edges": [],
+  "statistics": {
+    "node_count": 3,
+    "edge_count": 0
+  },
+  "saved_at": "2026-06-13T10:45:14.944329+00:00"
+}

@@ -1,0 +1,3123 @@
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 1 */
+# ============================================================
+# File: api/graph.py
+# ============================================================
+from datetime import datetime
+from typing import List, Optional
+from fastapi import APIRouter, Depends, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from app.core.auth import User, get_current_user, require_role, Role
+from app.core.exceptions import NotFoundException, ValidationException, AppException
+from app.core.knowledge_graph import KnowledgeGraph
+from app.models.entity import Entity, EntityType, Relation, RelationType
+router = APIRouter(prefix="/graph", tags=["graph"])
+class EntityCreate(BaseModel):
+    type: str = Field(..., min_length=1)
+    value: str = Field(..., min_length=1)
+    context: Optional[str] = None
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+class RelationCreate(BaseModel):
+    source_entity_id: str = Field(..., min_length=1)
+    target_entity_id: str = Field(..., min_length=1)
+    type: str = Field(..., min_length=1)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    evidence: Optional[str] = None
+class PathRequest(BaseModel):
+    source_id: str = Field(..., min_length=1)
+    target_id: str = Field(..., min_length=1)
+    max_depth: int = Field(default=5, ge=1, le=10)
+class CommunityRequest(BaseModel):
+    algorithm: str = Field(default="louvain")
+    min_size: int = Field(default=2, ge=2)
+def get_knowledge_graph(request: Request) -> KnowledgeGraph | None:
+    return getattr(request.app.state, "knowledge_graph", None)
+def _require_kg(request: Request) -> KnowledgeGraph:
+    kg = get_knowledge_graph(request)
+    if kg is None:
+        raise AppException(detail="知识图谱服务未初始化", error_code="KG_NOT_AVAILABLE", status_code=503)
+    return kg
+@router.get("/stats")
+async def graph_stats(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    kg = get_knowledge_graph(request)
+    if kg is None:
+        return {"node_count": 0, "edge_count": 0, "entity_types": {}}
+    try:
+        stats = await kg.get_statistics()
+        return stats
+    except Exception as exc:
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 2 */
+        logger.error(f"Failed to get graph stats: {exc}", exc_info=True)
+        return {"node_count": 0, "edge_count": 0, "entity_types": {}}
+@router.get("/entities")
+async def list_entities(
+    entity_type: Optional[str] = None,
+    search: Optional[str] = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    request: Request = None,
+    current_user: User = Depends(get_current_user),
+):
+    kg = get_knowledge_graph(request)
+    if kg is None:
+        return {"items": [], "total": 0, "offset": offset, "limit": limit}
+    try:
+        if search:
+            entities = await kg.search_entities(
+                query=search,
+                entity_type=entity_type,
+                limit=limit + offset,
+            )
+            total = len(entities)
+            paginated = entities[offset: offset + limit]
+        else:
+            all_entities = list(kg._entities.values())
+            if entity_type:
+                all_entities = [e for e in all_entities if e.type.value == entity_type]
+            def _sort_key(e):
+                ls = e.last_seen
+                if ls is None:
+                    return ""
+                if isinstance(ls, datetime) and ls.tzinfo is not None:
+                    return ls.replace(tzinfo=None).isoformat()
+                return ls.isoformat() if hasattr(ls, 'isoformat') else str(ls)
+            all_entities.sort(key=_sort_key, reverse=True)
+            total = len(all_entities)
+            paginated = all_entities[offset: offset + limit]
+        def _enrich_entity(e):
+            d = e.model_dump()
+            d["name"] = e.value
+            d["aliases"] = e.metadata.get("aliases", []) if isinstance(e.metadata, dict) else []
+            d["updated_at"] = e.last_seen.isoformat() if hasattr(e.last_seen, 'isoformat') else str(e.last_seen)
+            return d
+        return {
+            "items": [_enrich_entity(e) for e in paginated],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }
+    except Exception as exc:
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 3 */
+        logger.error(f"Failed to list graph entities: {exc}", exc_info=True)
+        return {"items": [], "total": 0, "offset": offset, "limit": limit}
+@router.get("/entities/{entity_id}")
+async def get_entity(
+    entity_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    kg = _require_kg(request)
+    try:
+        entity = await kg.get_entity(entity_id)
+        if entity is None:
+            raise NotFoundException(detail="实体未在知识图谱中找到")
+        relations = await kg.get_entity_relations(entity_id)
+        enriched_relations = []
+        for r in relations:
+            r_dict = r.model_dump()
+            source_entity = await kg.get_entity(r.source_entity_id)
+            target_entity = await kg.get_entity(r.target_entity_id)
+            r_dict["source_entity_value"] = source_entity.value if source_entity else r.source_entity_id
+            r_dict["source_entity_type"] = source_entity.type.value if source_entity else "unknown"
+            r_dict["target_entity_value"] = target_entity.value if target_entity else r.target_entity_id
+            r_dict["target_entity_type"] = target_entity.type.value if target_entity else "unknown"
+            enriched_relations.append(r_dict)
+        return {
+            "entity": entity.model_dump(),
+            "relations": enriched_relations,
+            "relation_count": len(relations),
+        }
+    except AppException:
+        raise
+    except Exception as exc:
+        logger.error(f"Failed to get entity {entity_id}: {exc}", exc_info=True)
+        raise AppException(detail="获取实体详情失败", error_code="GRAPH_ENTITY_ERROR")
+@router.get("/relations")
+async def list_relations(
+    relation_type: Optional[str] = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    request: Request = None,
+    current_user: User = Depends(get_current_user),
+):
+    kg = get_knowledge_graph(request)
+    if kg is None:
+        return {"items": [], "total": 0, "offset": offset, "limit": limit}
+    try:
+        all_relations = list(kg._relations.values())
+        logger.info(f"KnowledgeGraph _relations count: {len(all_relations)}, graph edges: {kg.graph.number_of_edges()}")
+        if not all_relations:
+            edge_relations = []
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 4 */
+            for u, v, data in kg.graph.edges(data=True):
+                rid = data.get("id", "")
+                if rid and rid in kg._relations:
+                    continue
+                rtype_str = data.get("type", "associated_with")
+                try:
+                    rtype = RelationType(rtype_str)
+                except ValueError:
+                    rtype = RelationType.ASSOCIATED_WITH
+                rel = Relation(
+                    id=rid or f"edge_{u}_{v}",
+                    source_entity_id=u,
+                    target_entity_id=v,
+                    type=rtype,
+                    confidence=data.get("confidence", 0.5),
+                    evidence=data.get("evidence", ""),
+                )
+                edge_relations.append(rel)
+            for rel in edge_relations:
+                kg._relations[rel.id] = rel
+            all_relations = list(kg._relations.values())
+        if relation_type:
+            all_relations = [r for r in all_relations if r.type.value == relation_type]
+        def _sort_key(r):
+            ls = r.last_seen
+            if isinstance(ls, datetime):
+                return ls
+            if isinstance(ls, str):
+                try:
+                    return datetime.fromisoformat(ls.replace(' ', 'T') if ' ' in ls else ls)
+                except Exception:
+                    return datetime.min
+            return datetime.min
+        all_relations.sort(key=_sort_key, reverse=True)
+        total = len(all_relations)
+        paginated = all_relations[offset: offset + limit]
+        result_items = []
+        for r in paginated:
+            try:
+                result_items.append(r.model_dump())
+            except Exception as e:
+                logger.warning(f"Failed to serialize relation {r.id}: {e}")
+        return {
+            "items": result_items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }
+    except Exception as exc:
+        logger.error(f"Failed to list relations: {exc}", exc_info=True)
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 5 */
+        return {"items": [], "total": 0, "offset": offset, "limit": limit}
+@router.post("/entities", status_code=201)
+async def add_entity(
+    data: EntityCreate,
+    request: Request,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    kg = _require_kg(request)
+    try:
+        try:
+            entity_type = EntityType(data.type)
+        except ValueError:
+            raise ValidationException(
+                detail=f"无效实体类型: {data.type}. 有效类型: {[t.value for t in EntityType]}",
+            )
+        entity = Entity(
+            type=entity_type,
+            value=data.value,
+            context=data.context,
+            confidence=data.confidence,
+        )
+        entity_id = await kg.add_entity(entity)
+        await kg.save()
+        return {"id": entity_id, **entity.model_dump()}
+    except AppException:
+        raise
+    except Exception as exc:
+        logger.error(f"Failed to add entity to graph: {exc}", exc_info=True)
+        raise AppException(detail="添加实体到知识图谱失败", error_code="GRAPH_ADD_ENTITY_ERROR")
+@router.delete("/entities/{entity_id}")
+async def delete_entity(
+    entity_id: str,
+    request: Request,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    kg = _require_kg(request)
+    try:
+        removed = await kg.remove_entity(entity_id)
+        if not removed:
+            raise NotFoundException(detail=f"实体 {entity_id} 未找到")
+        await kg.save()
+        return {"id": entity_id, "deleted": True}
+    except AppException:
+        raise
+    except Exception as exc:
+        logger.error(f"Failed to delete entity {entity_id}: {exc}", exc_info=True)
+        raise AppException(detail="删除实体失败", error_code="GRAPH_DELETE_ENTITY_ERROR")
+@router.post("/relations", status_code=201)
+async def add_relation(
+    data: RelationCreate,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 6 */
+    request: Request,
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    kg = _require_kg(request)
+    try:
+        try:
+            rel_type = RelationType(data.type)
+        except ValueError:
+            raise ValidationException(
+                detail=f"无效关系类型: {data.type}. 有效类型: {[t.value for t in RelationType]}",
+            )
+        source = await kg.get_entity(data.source_entity_id)
+        if source is None:
+            raise ValidationException(detail=f"源实体 {data.source_entity_id} 未找到")
+        target = await kg.get_entity(data.target_entity_id)
+        if target is None:
+            raise ValidationException(detail=f"目标实体 {data.target_entity_id} 未找到")
+        relation = Relation(
+            source_entity_id=data.source_entity_id,
+            target_entity_id=data.target_entity_id,
+            type=rel_type,
+            confidence=data.confidence,
+            evidence=data.evidence,
+        )
+        relation_id = await kg.add_relation(relation)
+        await kg.save()
+        return {"id": relation_id, **relation.model_dump()}
+    except AppException:
+        raise
+    except Exception as exc:
+        logger.error(f"Failed to add relation to graph: {exc}", exc_info=True)
+        raise AppException(detail="添加关系到知识图谱失败", error_code="GRAPH_ADD_RELATION_ERROR")
+@router.post("/path")
+async def find_path(
+    data: PathRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    kg = _require_kg(request)
+    try:
+        source = await kg.get_entity(data.source_id)
+        if source is None:
+            raise NotFoundException(detail=f"源实体 {data.source_id} 未找到")
+        target = await kg.get_entity(data.target_id)
+        if target is None:
+            raise NotFoundException(detail=f"目标实体 {data.target_id} 未找到")
+        paths = await kg.find_path(
+            data.source_id, data.target_id, max_depth=data.max_depth
+        )
+        if not paths:
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 7 */
+            return {
+                "source_id": data.source_id,
+                "target_id": data.target_id,
+                "paths": [],
+                "path_count": 0,
+                "message": "未找到连接路径，两个实体可能不在同一连通分量中",
+            }
+        enriched_paths = []
+        for path in paths:
+            enriched_nodes = []
+            for node_id in path:
+                entity = await kg.get_entity(node_id)
+                if entity:
+                    enriched_nodes.append({
+                        "id": entity.id,
+                        "type": entity.type.value,
+                        "value": entity.value,
+                    })
+                else:
+                    enriched_nodes.append({"id": node_id})
+            enriched_paths.append(enriched_nodes)
+        return {
+            "source_id": data.source_id,
+            "target_id": data.target_id,
+            "paths": enriched_paths,
+            "path_count": len(enriched_paths),
+        }
+    except AppException:
+        raise
+    except Exception as exc:
+        logger.error(f"Failed to find path: {exc}", exc_info=True)
+        raise AppException(detail="路径查找失败", error_code="GRAPH_PATH_ERROR")
+@router.post("/communities")
+async def find_communities(
+    data: CommunityRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    kg = get_knowledge_graph(request)
+    if kg is None:
+        return {"algorithm": data.algorithm, "communities": [], "community_count": 0}
+    try:
+        if len(kg._entities) == 0:
+            return {
+                "algorithm": data.algorithm,
+                "communities": [],
+                "community_count": 0,
+            }
+        communities = await kg.find_communities(algorithm=data.algorithm)
+        result = []
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 8 */
+        for community in communities:
+            if len(community) < data.min_size:
+                continue
+            members = []
+            for member_id in community:
+                entity = await kg.get_entity(member_id)
+                if entity:
+                    members.append({
+                        "id": entity.id,
+                        "type": entity.type.value,
+                        "value": entity.value,
+                    })
+            result.append({
+                "member_count": len(members),
+                "members": members,
+            })
+        return {
+            "algorithm": data.algorithm,
+            "communities": result,
+            "community_count": len(result),
+        }
+    except Exception as exc:
+        logger.error(f"Failed to find communities: {exc}", exc_info=True)
+        raise AppException(detail="社区发现失败", error_code="GRAPH_COMMUNITY_ERROR")
+@router.get("/subgraph/{entity_id}")
+async def get_subgraph(
+    entity_id: str,
+    depth: int = Query(1, ge=1, le=3),
+    request: Request = None,
+    current_user: User = Depends(get_current_user),
+):
+    kg = _require_kg(request)
+    try:
+        entity = await kg.get_entity(entity_id)
+        if entity is None:
+            raise NotFoundException(detail=f"实体 {entity_id} 未找到")
+        subgraph = await kg.get_subgraph([entity_id], depth=depth)
+        return subgraph
+    except AppException:
+        raise
+    except Exception as exc:
+        logger.error(f"Failed to get subgraph for {entity_id}: {exc}", exc_info=True)
+        raise AppException(detail="获取子图失败", error_code="GRAPH_SUBGRAPH_ERROR")
+@router.get("/export")
+async def export_graph(
+    format: str = Query("json"),
+    request: Request = None,
+    current_user: User = Depends(get_current_user),
+):
+    kg = _require_kg(request)
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 9 */
+    try:
+        data = await kg.export_graph(format=format)
+        return data
+    except ValueError as exc:
+        raise ValidationException(detail="操作失败")
+    except AppException:
+        raise
+    except Exception as exc:
+        logger.error(f"Failed to export graph: {exc}", exc_info=True)
+        raise AppException(detail="导出图谱失败", error_code="GRAPH_EXPORT_ERROR")
+@router.get("/data")
+async def get_graph_data(
+    entity_type: Optional[str] = None,
+    search: Optional[str] = None,
+    depth: int = Query(1, ge=1, le=3),
+    limit: int = Query(100, ge=1, le=1000),
+    request: Request = None,
+    current_user: User = Depends(get_current_user),
+):
+    kg = get_knowledge_graph(request)
+    if kg is None:
+        return {"nodes": [], "edges": []}
+    try:
+        nodes = []
+        edges = []
+        all_entities = list(kg._entities.values())
+        if entity_type:
+            all_entities = [e for e in all_entities if e.type.value == entity_type]
+        if search:
+            search_lower = search.lower()
+            all_entities = [e for e in all_entities if search_lower in e.value.lower()]
+        all_entities = all_entities[:limit]
+        for entity in all_entities:
+            nodes.append({
+                "id": entity.id,
+                "label": entity.value,
+                "entity_type": entity.type.value,
+                "properties": {},
+                "confidence": entity.confidence,
+            })
+        entity_ids = {e.id for e in all_entities}
+        for relation in kg._relations.values():
+            if relation.source_entity_id in entity_ids and relation.target_entity_id in entity_ids:
+                edges.append({
+                    "id": relation.id,
+                    "source": relation.source_entity_id,
+                    "target": relation.target_entity_id,
+                    "relation_type": relation.type.value,
+                    "properties": {},
+                    "confidence": relation.confidence,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 10 */
+                })
+        return {"nodes": nodes, "edges": edges}
+    except Exception as exc:
+        logger.error(f"Failed to get graph data: {exc}", exc_info=True)
+        return {"nodes": [], "edges": []}
+# ============================================================
+# File: api/entities.py
+# ============================================================
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.auth import User, get_current_user, require_role, Role
+from app.db.crud import EntityCRUD
+from app.db.database import get_db
+from app.models.entity import Entity, EntityType, Relation
+router = APIRouter(prefix="/entities", tags=["entities"])
+@router.post("", response_model=Entity, status_code=201)
+async def create_entity(
+    data: Entity,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    crud = EntityCRUD(db)
+    result = await crud.create_entity(data)
+    await db.commit()
+    return result
+@router.get("", response_model=dict)
+async def list_entities(
+    entity_type: EntityType | None = None,
+    min_confidence: float | None = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    crud = EntityCRUD(db)
+    items, total = await crud.list_entities(
+        entity_type=entity_type, min_confidence=min_confidence, offset=offset, limit=limit
+    )
+    await db.commit()
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
+@router.get("/search", response_model=dict)
+async def search_entities(
+    q: Optional[str] = Query(None, min_length=1),
+    query_param: Optional[str] = Query(None, min_length=1, alias="query"),
+    entity_type: EntityType | None = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    request: Request = None,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 11 */
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    search_query = q or query_param
+    if not search_query:
+        raise HTTPException(status_code=422, detail="Either 'q' or 'query' parameter is required")
+    vector_store = getattr(request.app.state, "vector_store", None)
+    if vector_store is not None:
+        try:
+            vs_results = await vector_store.search(
+                query=search_query,
+                n_results=limit,
+                collection="intelligence",
+            )
+            if vs_results:
+                items = []
+                for r in vs_results:
+                    metadata = r.get("metadata", {})
+                    doc = r.get("document", "")
+                    entity_value = (
+                        metadata.get("entity_value")
+                        or metadata.get("value")
+                        or metadata.get("name")
+                        or metadata.get("title")
+                        or metadata.get("indicator")
+                        or (doc[:50].strip() if doc else "")
+                    )
+                    entity_type = (
+                        metadata.get("entity_type")
+                        or metadata.get("type")
+                        or metadata.get("ioc_type")
+                        or metadata.get("threat_type")
+                        or metadata.get("breach_type")
+                        or metadata.get("exploit_type")
+                        or metadata.get("file_type")
+                        or metadata.get("species")
+                        or metadata.get("category")
+                        or metadata.get("source_type")
+                        or metadata.get("source")
+                        or "unknown"
+                    )
+                    distance = r.get("distance")
+                    score = 1.0 - distance if distance is not None else None
+                    items.append({
+                        "id": r.get("id", ""),
+                        "type": entity_type,
+                        "value": entity_value,
+                        "document": doc,
+                        "metadata": metadata,
+                        "distance": distance,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 12 */
+                        "score": score,
+                    })
+                return {"items": items, "total": len(items), "offset": offset, "limit": limit}
+        except Exception as exc:
+            logger.warning(f"VectorStore search failed, falling back to DB: {exc}")
+    crud = EntityCRUD(db)
+    items, total = await crud.search_entities(
+        query=search_query, entity_type=entity_type, offset=offset, limit=limit
+    )
+    await db.commit()
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
+@router.get("/{entity_id}", response_model=Entity)
+async def get_entity(
+    entity_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    crud = EntityCRUD(db)
+    result = await crud.get_entity(entity_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    return result
+@router.patch("/{entity_id}", response_model=Entity)
+async def update_entity(
+    entity_id: str,
+    updates: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    crud = EntityCRUD(db)
+    result = await crud.update_entity(entity_id, **updates)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    await db.commit()
+    return result
+@router.delete("/{entity_id}", status_code=204)
+async def delete_entity(
+    entity_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    crud = EntityCRUD(db)
+    deleted = await crud.delete_entity(entity_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    await db.commit()
+@router.post("/relations", response_model=Relation, status_code=201)
+async def create_relation(
+    data: Relation,
+    db: AsyncSession = Depends(get_db),
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 13 */
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    crud = EntityCRUD(db)
+    result = await crud.create_relation(data)
+    await db.commit()
+    return result
+@router.get("/{entity_id}/relations", response_model=List[Relation])
+async def get_entity_relations(
+    entity_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    crud = EntityCRUD(db)
+    return await crud.get_relations_for_entity(entity_id)
+@router.delete("/relations/{relation_id}", status_code=204)
+async def delete_relation(
+    relation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(Role.ADMIN, Role.ANALYST)),
+):
+    crud = EntityCRUD(db)
+    deleted = await crud.delete_relation(relation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Relation not found")
+    await db.commit()
+# ============================================================
+# File: api/ner.py
+# ============================================================
+from typing import Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+from pydantic import BaseModel, Field
+from app.core.auth import User, get_current_user
+router = APIRouter(prefix="/ner", tags=["NER实体提取"])
+class NERExtractRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=50000)
+    use_llm: bool = Field(True)
+class NERBatchExtractRequest(BaseModel):
+    texts: List[str] = Field(..., min_length=1, max_length=50)
+    use_llm: bool = Field(True)
+def _get_ner_engine(request: Request):
+    engine = getattr(request.app.state, "ner_engine", None)
+    if engine is None:
+        from app.core.ner_engine import ThreatNEREngine
+        llm = getattr(request.app.state, "llm", None)
+        engine = ThreatNEREngine(llm_service=llm)
+        request.app.state.ner_engine = engine
+    return engine
+@router.post("/extract")
+async def extract_entities(
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 14 */
+    req: NERExtractRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    engine = _get_ner_engine(request)
+    entities = await engine.extract(req.text, use_llm=req.use_llm)
+    return {
+        "success": True,
+        "data": {
+            "entities": [e.to_dict() for e in entities],
+            "count": len(entities),
+        },
+    }
+@router.post("/extract-batch")
+async def extract_entities_batch(
+    req: NERBatchExtractRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    engine = _get_ner_engine(request)
+    results = await engine.extract_batch(req.texts, use_llm=req.use_llm)
+    return {
+        "success": True,
+        "data": {
+            "results": [
+                {"entities": [e.to_dict() for e in entities], "count": len(entities)}
+                for entities in results
+            ],
+            "total_texts": len(req.texts),
+        },
+    }
+@router.post("/extract-sync")
+async def extract_entities_sync(
+    req: NERExtractRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    engine = _get_ner_engine(request)
+    entities = engine.extract_sync(req.text)
+    return {
+        "success": True,
+        "data": {
+            "entities": entities,
+            "count": len(entities),
+        },
+    }
+# ============================================================
+# File: core/knowledge_graph.py
+# ============================================================
+import asyncio
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 15 */
+import itertools
+import json
+import os
+import tempfile
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+import networkx as nx
+from loguru import logger
+from app.models.entity import Entity, EntityType, Relation, RelationType
+class KnowledgeGraph:
+    PERSIST_FILENAME = "knowledge_graph.json"
+    def __init__(self, persist_dir: str = "./graph_data"):
+        self.persist_dir = Path(persist_dir)
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self.persist_path = self.persist_dir / self.PERSIST_FILENAME
+        self.graph = nx.DiGraph()
+        self._entities: Dict[str, Entity] = {}
+        self._relations: Dict[str, Relation] = {}
+        self._max_entities = 10000
+        self._max_relations = 50000
+        self._lock = asyncio.Lock()
+        self._load_on_init = True
+        try:
+            data = self._load_sync()
+            if data:
+                self._import_data(data)
+            logger.info(
+                f"KnowledgeGraph loaded: {self.graph.number_of_nodes()} nodes, "
+                f"{self.graph.number_of_edges()} edges"
+            )
+        except Exception:
+            logger.info("KnowledgeGraph initialized empty (no persisted data found)")
+    async def add_entity(self, entity: Entity) -> str:
+        async with self._lock:
+            for existing in self._entities.values():
+                if existing.type == entity.type and existing.value == entity.value:
+                    if entity.source_ids:
+                        for sid in entity.source_ids:
+                            if sid not in existing.source_ids:
+                                existing.source_ids.append(sid)
+                    existing.last_seen = datetime.now(timezone.utc)
+                    if entity.confidence > existing.confidence:
+                        existing.confidence = entity.confidence
+                    logger.debug(f"Entity dedup: {entity.type.value}:{entity.value} already exists as {existing.id}")
+                    return existing.id
+            self._entities[entity.id] = entity
+            if len(self._entities) > self._max_entities:
+                oldest_entity = next(iter(self._entities))
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 16 */
+                del self._entities[oldest_entity]
+            self.graph.add_node(
+                entity.id,
+                type=entity.type.value,
+                value=entity.value,
+                confidence=entity.confidence,
+                context=entity.context or "",
+            )
+            logger.debug(f"Added entity to graph: {entity.id} ({entity.type.value}: {entity.value})")
+            return entity.id
+    async def add_relation(self, relation: Relation) -> str:
+        async with self._lock:
+            if relation.source_entity_id not in self._entities:
+                logger.warning(
+                    f"Source entity {relation.source_entity_id} not found, adding placeholder"
+                )
+            if relation.target_entity_id not in self._entities:
+                logger.warning(
+                    f"Target entity {relation.target_entity_id} not found, adding placeholder"
+                )
+            self._relations[relation.id] = relation
+            if len(self._relations) > self._max_relations:
+                oldest_relation = next(iter(self._relations))
+                del self._relations[oldest_relation]
+            self.graph.add_edge(
+                relation.source_entity_id,
+                relation.target_entity_id,
+                id=relation.id,
+                type=relation.type.value,
+                confidence=relation.confidence,
+                evidence=relation.evidence or "",
+            )
+            logger.debug(
+                f"Added relation to graph: {relation.id} "
+                f"({relation.source_entity_id} -[{relation.type.value}]-> {relation.target_entity_id})"
+            )
+            return relation.id
+    async def get_entity(self, entity_id: str) -> Optional[Entity]:
+        return self._entities.get(entity_id)
+    async def remove_entity(self, entity_id: str) -> bool:
+        async with self._lock:
+            if entity_id not in self._entities:
+                return False
+            relation_ids_to_remove = [
+                rid for rid, r in self._relations.items()
+                if r.source_entity_id == entity_id or r.target_entity_id == entity_id
+            ]
+            for rid in relation_ids_to_remove:
+                del self._relations[rid]
+            if entity_id in self.graph:
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 17 */
+                self.graph.remove_node(entity_id)
+            del self._entities[entity_id]
+            logger.debug(f"Removed entity {entity_id} and {len(relation_ids_to_remove)} associated relations")
+            return True
+    async def get_relation(self, relation_id: str) -> Optional[Relation]:
+        return self._relations.get(relation_id)
+    async def get_entity_relations(
+        self,
+        entity_id: str,
+        direction: str = "both",
+        relation_type: Optional[str] = None,
+    ) -> List[Relation]:
+        if entity_id not in self.graph:
+            return []
+        edge_ids: Set[str] = set()
+        if direction in ("both", "outgoing"):
+            for _, target, data in self.graph.out_edges(entity_id, data=True):
+                if relation_type is None or data.get("type") == relation_type:
+                    edge_ids.add(data.get("id", ""))
+        if direction in ("both", "incoming"):
+            for source, _, data in self.graph.in_edges(entity_id, data=True):
+                if relation_type is None or data.get("type") == relation_type:
+                    edge_ids.add(data.get("id", ""))
+        return [self._relations[rid] for rid in edge_ids if rid in self._relations]
+    async def search_entities(
+        self,
+        query: str,
+        entity_type: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Entity]:
+        results: List[Entity] = []
+        query_lower = query.lower()
+        for entity in self._entities.values():
+            if entity_type and entity.type.value != entity_type:
+                continue
+            if query_lower in entity.value.lower() or (
+                entity.context and query_lower in entity.context.lower()
+            ):
+                results.append(entity)
+                if len(results) >= limit:
+                    break
+        return results
+    async def find_path(
+        self,
+        source_id: str,
+        target_id: str,
+        max_depth: int = 5,
+    ) -> List[List[str]]:
+        if source_id not in self.graph or target_id not in self.graph:
+            return []
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 18 */
+        max_paths = 10
+        max_depth = min(max_depth, 5)
+        if self.graph.number_of_nodes() > 1000:
+            max_depth = min(max_depth, 3)
+            logger.info(f"Large graph ({self.graph.number_of_nodes()} nodes), limiting max_depth to {max_depth}")
+        try:
+            undirected = self.graph.to_undirected()
+            all_paths: List[List[str]] = list(
+                itertools.islice(
+                    nx.all_simple_paths(undirected, source_id, target_id, cutoff=max_depth),
+                    max_paths,
+                )
+            )
+            all_paths.sort(key=len)
+            return all_paths[:5]
+        except nx.NetworkXNoPath:
+            return []
+        except Exception as exc:
+            logger.error(f"Path finding failed: {exc}")
+            return []
+    async def find_communities(self, algorithm: str = "louvain") -> List[List[str]]:
+        if self.graph.number_of_nodes() == 0:
+            return []
+        try:
+            undirected = self.graph.to_undirected()
+            if algorithm == "louvain":
+                from networkx.algorithms.community import louvain_communities
+                communities = louvain_communities(undirected, seed=42)
+            elif algorithm == "greedy":
+                from networkx.algorithms.community import greedy_modularity_communities
+                communities = greedy_modularity_communities(undirected)
+            else:
+                from networkx.algorithms.community import louvain_communities
+                communities = louvain_communities(undirected, seed=42)
+            result: List[List[str]] = []
+            for community in communities:
+                members = [str(node) for node in community]
+                if len(members) >= 2:
+                    result.append(members)
+            result.sort(key=len, reverse=True)
+            return result
+        except Exception as exc:
+            logger.error(f"Community detection failed: {exc}")
+            return []
+    async def get_subgraph(
+        self,
+        entity_ids: List[str],
+        depth: int = 1,
+        max_nodes: int = 500,
+    ) -> Dict:
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 19 */
+        visited_nodes: Set[str] = set(entity_ids)
+        visited_edges: Set[str] = set()
+        current_frontier = set(entity_ids)
+        for _ in range(depth):
+            if len(visited_nodes) >= max_nodes:
+                break
+            next_frontier: Set[str] = set()
+            for node_id in current_frontier:
+                if node_id not in self.graph:
+                    continue
+                if len(visited_nodes) >= max_nodes:
+                    break
+                for _, target, data in self.graph.out_edges(node_id, data=True):
+                    if len(visited_nodes) >= max_nodes:
+                        break
+                    visited_nodes.add(target)
+                    edge_id = data.get("id", "")
+                    if edge_id:
+                        visited_edges.add(edge_id)
+                    next_frontier.add(target)
+                for source, _, data in self.graph.in_edges(node_id, data=True):
+                    if len(visited_nodes) >= max_nodes:
+                        break
+                    visited_nodes.add(source)
+                    edge_id = data.get("id", "")
+                    if edge_id:
+                        visited_edges.add(edge_id)
+                    next_frontier.add(source)
+            current_frontier = next_frontier - visited_nodes
+            if not current_frontier:
+                break
+        if len(visited_nodes) > max_nodes:
+            sorted_nodes = sorted(visited_nodes)
+            visited_nodes = set(sorted_nodes[:max_nodes])
+            visited_edges = {
+                rid for rid in visited_edges
+                if rid in self._relations
+                and self._relations[rid].source_entity_id in visited_nodes
+                and self._relations[rid].target_entity_id in visited_nodes
+            }
+        entities = [
+            self._entities[eid].model_dump()
+            for eid in visited_nodes
+            if eid in self._entities
+        ]
+        relations = [
+            self._relations[rid].model_dump()
+            for rid in visited_edges
+            if rid in self._relations
+        ]
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 20 */
+        return {
+            "entities": entities,
+            "relations": relations,
+            "node_count": len(entities),
+            "edge_count": len(relations),
+            "truncated": len(visited_nodes) >= max_nodes,
+        }
+    async def get_statistics(self) -> Dict:
+        node_count = self.graph.number_of_nodes()
+        edge_count = self.graph.number_of_edges()
+        type_counts: Dict[str, int] = defaultdict(int)
+        for entity in self._entities.values():
+            type_counts[entity.type.value] += 1
+        relation_type_counts: Dict[str, int] = defaultdict(int)
+        for relation in self._relations.values():
+            relation_type_counts[relation.type.value] += 1
+        density = (
+            nx.density(self.graph) if node_count > 0 else 0.0
+        )
+        avg_clustering = 0.0
+        if node_count > 0:
+            try:
+                undirected = self.graph.to_undirected()
+                avg_clustering = nx.average_clustering(undirected)
+            except Exception:
+                avg_clustering = 0.0
+        connected_components = 0
+        if node_count > 0:
+            try:
+                undirected = self.graph.to_undirected()
+                connected_components = nx.number_connected_components(undirected)
+            except Exception:
+                connected_components = 0
+        return {
+            "node_count": node_count,
+            "edge_count": edge_count,
+            "entity_types": dict(type_counts),
+            "relation_types": dict(relation_type_counts),
+            "density": density,
+            "average_clustering": avg_clustering,
+            "connected_components": connected_components,
+        }
+    async def export_graph(self, format: str = "json") -> Dict:
+        if format != "json":
+            raise ValueError(f"Unsupported export format: {format}. Only 'json' is supported.")
+        entities_data = {}
+        for eid, entity in self._entities.items():
+            entities_data[eid] = entity.model_dump()
+        relations_data = {}
+        for rid, relation in self._relations.items():
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 21 */
+            relations_data[rid] = relation.model_dump()
+        node_data = {}
+        for node_id in self.graph.nodes:
+            node_data[node_id] = dict(self.graph.nodes[node_id])
+        edge_data = []
+        for source, target, data in self.graph.edges(data=True):
+            edge_data.append({"source": source, "target": target, **data})
+        return {
+            "entities": entities_data,
+            "relations": relations_data,
+            "nodes": node_data,
+            "edges": edge_data,
+            "statistics": {
+                "node_count": self.graph.number_of_nodes(),
+                "edge_count": self.graph.number_of_edges(),
+            },
+        }
+    async def import_graph(self, data: Dict):
+        async with self._lock:
+            entities_data = data.get("entities", {})
+            for eid, edata in entities_data.items():
+                try:
+                    entity = Entity(**edata)
+                    self._entities[eid] = entity
+                    self.graph.add_node(
+                        eid,
+                        type=entity.type.value,
+                        value=entity.value,
+                        confidence=entity.confidence,
+                        context=entity.context or "",
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed to import entity {eid}: {exc}")
+            relations_data = data.get("relations", {})
+            for rid, rdata in relations_data.items():
+                try:
+                    relation = Relation(**rdata)
+                    self._relations[rid] = relation
+                    self.graph.add_edge(
+                        relation.source_entity_id,
+                        relation.target_entity_id,
+                        id=relation.id,
+                        type=relation.type.value,
+                        confidence=relation.confidence,
+                        evidence=relation.evidence or "",
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed to import relation {rid}: {exc}")
+            logger.info(
+                f"Imported graph: {len(self._entities)} entities, {len(self._relations)} relations"
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 22 */
+            )
+    async def save(self):
+        try:
+            data = await self.export_graph(format="json")
+            data["saved_at"] = datetime.now(timezone.utc).isoformat()
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                suffix=".tmp",
+                prefix=self.PERSIST_FILENAME,
+                dir=str(self.persist_path.parent),
+            )
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+                os.replace(tmp_path, str(self.persist_path))
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
+            logger.info(
+                f"KnowledgeGraph saved to {self.persist_path}: "
+                f"{len(self._entities)} entities, {len(self._relations)} relations"
+            )
+        except Exception as exc:
+            logger.error(f"Failed to save KnowledgeGraph: {exc}")
+            raise
+    async def load(self):
+        if not self.persist_path.exists():
+            logger.debug("No persisted graph file found, starting fresh")
+            return
+        try:
+            with open(self.persist_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            await self.import_graph(data)
+            logger.info(f"KnowledgeGraph loaded from {self.persist_path}")
+        except Exception as exc:
+            logger.error(f"Failed to load KnowledgeGraph: {exc}")
+            raise
+    def _load_sync(self) -> Optional[Dict]:
+        if not self.persist_path.exists():
+            return None
+        try:
+            with open(self.persist_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    def _import_data(self, data: Dict):
+        entities_data = data.get("entities", {})
+        for eid, edata in entities_data.items():
+            try:
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 23 */
+                entity = Entity(**edata)
+                self._entities[eid] = entity
+                self.graph.add_node(
+                    eid,
+                    type=entity.type.value,
+                    value=entity.value,
+                    confidence=entity.confidence,
+                    context=entity.context or "",
+                )
+            except Exception:
+                pass
+        relations_data = data.get("relations", {})
+        for rid, rdata in relations_data.items():
+            try:
+                relation = Relation(**rdata)
+                self._relations[rid] = relation
+                self.graph.add_edge(
+                    relation.source_entity_id,
+                    relation.target_entity_id,
+                    id=relation.id,
+                    type=relation.type.value,
+                    confidence=relation.confidence,
+                    evidence=relation.evidence or "",
+                )
+            except Exception:
+                pass
+# ============================================================
+# File: core/ner_engine.py
+# ============================================================
+import ipaddress
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from loguru import logger
+from app.core.rule_based_extractor import RuleBasedExtractor
+@dataclass
+class NEREntity:
+    entity_type: str
+    value: str
+    start: int
+    end: int
+    confidence: float
+    source: str = "rule"
+    context: str = ""
+    metadata: Dict = field(default_factory=dict)
+    def to_dict(self) -> Dict:
+        d = {
+            "type": self.entity_type,
+            "value": self.value,
+            "start": self.start,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 24 */
+            "end": self.end,
+            "confidence": round(self.confidence, 4),
+            "source": self.source,
+        }
+        if self.context:
+            d["context"] = self.context
+        if self.metadata:
+            d["metadata"] = self.metadata
+        return d
+_VALID_TLDS = {
+    "com", "net", "org", "io", "cn", "cc", "tk", "ml", "ga", "cf", "gq",
+    "xyz", "top", "club", "online", "site", "info", "biz", "ru", "uk", "de",
+    "fr", "jp", "kr", "tw", "hk", "me", "tv", "co", "app", "dev", "onion",
+    "mobi", "pro", "asia", "name", "ws", "am", "fm", "cd", "dj", "la", "ms",
+    "nu", "sc", "tg", "vc", "ag", "bz", "lc", "mn", "ph", "pk", "sg", "th",
+    "vn", "id", "my", "in", "br", "mx", "ar", "cl", "pe", "ec", "ve", "co",
+    "au", "nz", "za", "ng", "ke", "eg", "sa", "ae", "il", "tr", "ir", "pk",
+    "bd", "lk", "mm", "kh", "la", "kp", "mn", "kz", "uz", "tj", "tm", "az",
+    "ge", "am", "by", "ua", "md", "ro", "bg", "rs", "hr", "si", "sk", "cz",
+    "pl", "lt", "lv", "ee", "fi", "se", "no", "dk", "is", "ie", "pt", "es",
+    "it", "gr", "al", "mk", "ba", "me", "xk", "mt", "cy", "lu", "be", "nl",
+    "at", "ch", "li", "hu", "sk", "si",
+}
+_ID_CARD_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+_ID_CARD_CHECK = "10X98765432"
+_IPV4_PATTERN = re.compile(
+    r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
+)
+_IPV4_PRIVATE = re.compile(
+    r'\b(?:(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}|'
+    r'(?:172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}|'
+    r'192\.168\.\d{1,3}\.\d{1,3})\b'
+)
+_DOMAIN_PATTERN = re.compile(
+    r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)'
+    r'+(?:[a-zA-Z]{2,})\b'
+)
+_URL_PATTERN = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
+_EMAIL_PATTERN = re.compile(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b')
+_PHONE_CN_PATTERN = re.compile(r'\b1[3-9]\d{9}\b')
+_ID_CARD_PATTERN = re.compile(r'\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b')
+_BANK_CARD_PATTERN = re.compile(r'\b(?:62|4|5)\d{14,18}\b')
+_CVE_PATTERN = re.compile(r'CVE-\d{4}-\d{4,}', re.IGNORECASE)
+_MD5_PATTERN = re.compile(r'\b[a-fA-F0-9]{32}\b')
+_SHA256_PATTERN = re.compile(r'\b[a-fA-F0-9]{64}\b')
+_BTC_PATTERN = re.compile(r'\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b')
+_BTC_BECH32_PATTERN = re.compile(r'\bbc1[a-zA-HJ-NP-Z0-9]{25,90}\b')
+_ETH_PATTERN = re.compile(r'\b0x[a-fA-F0-9]{40}\b')
+_TRON_PATTERN = re.compile(r'\bT[A-Za-z1-9]{33}\b')
+_TELEGRAM_CHANNEL_PATTERN = re.compile(r'@([a-zA-Z]\w{4,31})')
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 25 */
+_DARKWEB_MARKET_PATTERN = re.compile(
+    r'(?:暗网市场|darkweb\s*market|黑市|暗市|underground\s*market)',
+    re.IGNORECASE,
+)
+_THREAT_ACTOR_PATTERN = re.compile(
+    r'(?:APT\d{1,4}|Lazarus|Kimsuky|Carbanak|FIN\d{1,4}|TA\d{1,4}|'
+    r'黑产团伙|灰产组织|黑客组织|攻击组织|威胁行为者)',
+    re.IGNORECASE,
+)
+_MALWARE_NAME_PATTERN = re.compile(
+    r'(?:木马|病毒|蠕虫|勒索软件|远控|RAT|botnet|trojan|worm|ransomware|'
+    r'malware|backdoor|rootkit|keylogger|spyware|adware|dropper|loader|'
+    r'冰蝎|蚁剑|哥斯拉|Cobalt\s*Strike|Metasploit|Emotet|TrickBot|'
+    r'QakBot|IcedID|Dridex|Zeus|SpyEye|Carberp|Flame|Stuxnet)',
+    re.IGNORECASE,
+)
+_TOOL_NAME_CONTEXT_PATTERN = re.compile(
+    r'(?:工具|tool|软件|software|程序|program)[：:\s]*([a-zA-Z0-9_\-\u4e00-\u9fff]{2,40})\b',
+    re.IGNORECASE,
+)
+def _validate_ip(ip_str: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return not (
+            addr.is_private or addr.is_reserved or addr.is_loopback
+            or addr.is_multicast or addr.is_link_local
+        )
+    except ValueError:
+        return False
+def _validate_domain(domain: str) -> bool:
+    parts = domain.split(".")
+    if len(parts) < 2:
+        return False
+    tld = parts[-1].lower()
+    return tld in _VALID_TLDS
+def _luhn_check(number_str: str) -> bool:
+    digits = [int(d) for d in number_str if d.isdigit()]
+    if not digits:
+        return False
+    odd_digits = digits[-1::-2]
+    even_digits = digits[-2::-2]
+    total = sum(odd_digits)
+    for d in even_digits:
+        total += sum(divmod(d * 2, 10))
+    return total % 10 == 0
+def _validate_id_card(id_str: str) -> bool:
+    if len(id_str) != 18:
+        return False
+    digits = id_str[:17]
+    if not digits.isdigit():
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 26 */
+        return False
+    try:
+        total = sum(int(d) * w for d, w in zip(digits, _ID_CARD_WEIGHTS))
+        check_char = _ID_CARD_CHECK[total % 11]
+        return id_str[-1].upper() == check_char
+    except (ValueError, IndexError):
+        return False
+class EnhancedRuleNER:
+    def extract(self, text: str) -> List[NEREntity]:
+        if not text:
+            return []
+        entities: List[NEREntity] = []
+        seen: Dict[str, str] = {}
+        extractors = [
+            self._extract_ips,
+            self._extract_domains,
+            self._extract_urls,
+            self._extract_emails,
+            self._extract_phones,
+            self._extract_id_cards,
+            self._extract_bank_cards,
+            self._extract_cves,
+            self._extract_md5,
+            self._extract_sha256,
+            self._extract_crypto_wallets,
+            self._extract_telegram_channels,
+            self._extract_darkweb_markets,
+            self._extract_threat_actors,
+            self._extract_malware_names,
+            self._extract_tool_names,
+        ]
+        for extractor in extractors:
+            for entity in extractor(text):
+                key = f"{entity.entity_type}:{entity.value}"
+                if key not in seen:
+                    seen[key] = entity.entity_type
+                    entities.append(entity)
+        return entities
+    def _extract_ips(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _IPV4_PATTERN.finditer(text):
+            val = match.group()
+            is_valid = _validate_ip(val)
+            is_private = bool(_IPV4_PRIVATE.fullmatch(val))
+            confidence = 0.6 if is_private else (0.95 if is_valid else 0.7)
+            results.append(NEREntity(
+                entity_type="IP", value=val,
+                start=match.start(), end=match.end(),
+                confidence=confidence, source="rule",
+                metadata={"is_private": is_private, "is_valid_public": is_valid},
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 27 */
+            ))
+        return results
+    def _extract_domains(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _DOMAIN_PATTERN.finditer(text):
+            val = match.group()
+            if _URL_PATTERN.search(val):
+                continue
+            is_valid = _validate_domain(val)
+            confidence = 0.9 if is_valid else 0.5
+            results.append(NEREntity(
+                entity_type="DOMAIN", value=val,
+                start=match.start(), end=match.end(),
+                confidence=confidence, source="rule",
+                metadata={"tld_valid": is_valid},
+            ))
+        return results
+    def _extract_urls(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _URL_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="URL", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.95, source="rule",
+            ))
+        return results
+    def _extract_emails(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _EMAIL_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="EMAIL", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.92, source="rule",
+            ))
+        return results
+    def _extract_phones(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _PHONE_CN_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="PHONE", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.88, source="rule",
+            ))
+        return results
+    def _extract_id_cards(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _ID_CARD_PATTERN.finditer(text):
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 28 */
+            val = match.group()
+            is_valid = _validate_id_card(val)
+            confidence = 0.93 if is_valid else 0.4
+            results.append(NEREntity(
+                entity_type="ID_CARD", value=val[:6] + "********" + val[-4:],
+                start=match.start(), end=match.end(),
+                confidence=confidence, source="rule",
+                metadata={"luhn_valid": is_valid},
+            ))
+        return results
+    def _extract_bank_cards(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _BANK_CARD_PATTERN.finditer(text):
+            val = match.group()
+            if _PHONE_CN_PATTERN.fullmatch(val):
+                continue
+            is_valid = _luhn_check(val)
+            confidence = 0.9 if is_valid else 0.5
+            results.append(NEREntity(
+                entity_type="BANK_CARD", value=val[:4] + "****" + val[-4:],
+                start=match.start(), end=match.end(),
+                confidence=confidence, source="rule",
+                metadata={"luhn_valid": is_valid},
+            ))
+        return results
+    def _extract_cves(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _CVE_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="CVE", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.95, source="rule",
+            ))
+        return results
+    def _extract_md5(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _MD5_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="MD5", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.8, source="rule",
+            ))
+        return results
+    def _extract_sha256(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _SHA256_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 29 */
+                entity_type="SHA256", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.9, source="rule",
+            ))
+        return results
+    def _extract_crypto_wallets(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _BTC_PATTERN.finditer(text):
+            val = match.group()
+            if _IPV4_PATTERN.fullmatch(val):
+                continue
+            results.append(NEREntity(
+                entity_type="CRYPTO_WALLET", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.82, source="rule",
+                metadata={"crypto_type": "btc"},
+            ))
+        for match in _BTC_BECH32_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="CRYPTO_WALLET", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.88, source="rule",
+                metadata={"crypto_type": "btc_bech32"},
+            ))
+        for match in _ETH_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="CRYPTO_WALLET", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.87, source="rule",
+                metadata={"crypto_type": "eth"},
+            ))
+        for match in _TRON_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="CRYPTO_WALLET", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.85, source="rule",
+                metadata={"crypto_type": "tron"},
+            ))
+        return results
+    def _extract_telegram_channels(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _TELEGRAM_CHANNEL_PATTERN.finditer(text):
+            val = match.group(1)
+            results.append(NEREntity(
+                entity_type="TELEGRAM_CHANNEL", value=f"@{val}",
+                start=match.start(), end=match.end(),
+                confidence=0.75, source="rule",
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 30 */
+            ))
+        return results
+    def _extract_darkweb_markets(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _DARKWEB_MARKET_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="DARKWEB_MARKET", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.7, source="rule",
+            ))
+        return results
+    def _extract_threat_actors(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _THREAT_ACTOR_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="THREAT_ACTOR", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.8, source="rule",
+            ))
+        return results
+    def _extract_malware_names(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _MALWARE_NAME_PATTERN.finditer(text):
+            val = match.group()
+            results.append(NEREntity(
+                entity_type="MALWARE_NAME", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.75, source="rule",
+            ))
+        return results
+    def _extract_tool_names(self, text: str) -> List[NEREntity]:
+        results = []
+        for match in _TOOL_NAME_CONTEXT_PATTERN.finditer(text):
+            val = match.group(1)
+            results.append(NEREntity(
+                entity_type="TOOL_NAME", value=val,
+                start=match.start(), end=match.end(),
+                confidence=0.65, source="rule",
+            ))
+        return results
+class LLMNERExtractor:
+    def __init__(self, llm_service=None):
+        self._llm = llm_service
+    async def extract(self, text: str) -> List[NEREntity]:
+        if self._llm is None:
+            return []
+        if not text or not text.strip():
+            return []
+
+/* ............................................................ 中间代码省略 ............................................................ */
+
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 31 */
+                </div>
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 12,
+                  marginBottom: 16,
+                }}>
+                  <div style={{
+                    width: 11,
+                    height: 11,
+                    background: NODE_COLORS[selectedNode._entityType] || '#6b7280',
+                    borderRadius: 6,
+                    flexShrink: 0,
+                    boxShadow: `0 0 0 3px ${NODE_COLORS[selectedNode._entityType] || '#6b7280'}20`,
+                  }} />
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{
+                      ...FB,
+                      fontWeight: 700,
+                      fontSize: 14,
+                      color: '#1E293B',
+                      lineHeight: 1.3,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}>{selectedNode.label}</div>
+                    <div style={{
+                      ...FB,
+                      fontSize: 11,
+                      color: '#9CA3AF',
+                      marginTop: 3,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}>{selectedNode.id}</div>
+                  </div>
+                </div>
+                <Tag style={{
+                  color: NODE_COLORS[selectedNode._entityType] || '#6b7280',
+                  border: `1px solid ${NODE_COLORS[selectedNode._entityType] || '#6b7280'}25`,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  borderRadius: 6,
+                  padding: '3px 10px',
+                  ...FB,
+                  background: `${NODE_COLORS[selectedNode._entityType] || '#6b7280'}08`,
+                }}>
+                  {NODE_LABELS[selectedNode._entityType] || selectedNode._entityType || '未知'}
+                </Tag>
+                <div style={{
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 32 */
+                  marginTop: 16,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                }}>
+                  <div style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    padding: '10px 14px',
+                    background: '#F9FAFB',
+                    borderRadius: 10,
+                  }}>
+                    <span style={{ ...FB, fontSize: 12, color: '#9CA3AF', fontWeight: 500 }}>连接度</span>
+                    <span style={{
+                      ...NUM,
+                      fontSize: 14,
+                      color: '#1E293B',
+                      fontWeight: 700,
+                    }}>{selectedNode._degree || 0} <span style={{ fontSize: 11, fontWeight: 500, color: '#9CA3AF' }}>条边</span></span>
+                  </div>
+                  <div style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    padding: '10px 14px',
+                    background: '#F9FAFB',
+                    borderRadius: 10,
+                  }}>
+                    <span style={{ ...FB, fontSize: 12, color: '#9CA3AF', fontWeight: 500 }}>置信度</span>
+                    <span style={{
+                      ...NUM,
+                      fontSize: 14,
+                      color: '#1E293B',
+                      fontWeight: 700,
+                    }}>{selectedNode._confidence != null ? `${Math.round(selectedNode._confidence * 100)}%` : '—'}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          {/* Path result */}
+          {pathResult && (
+            <div style={{
+              background: '#FFFFFF',
+              border: '1px solid #E5E7EB',
+              borderRadius: 14,
+              overflow: 'hidden',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.01)',
+            }}>
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 33 */
+              <div style={{ height: 3, background: 'linear-gradient(90deg, #0891b2, #0891b288)' }} />
+              <div style={{ padding: 18 }}>
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  marginBottom: 14,
+                }}>
+                  <div style={{
+                    width: 24,
+                    height: 24,
+                    borderRadius: 7,
+                    background: '#0891b212',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}>
+                    <ShareAltOutlined style={{ color: '#0891b2', fontSize: 11 }} />
+                  </div>
+                  <span style={{
+                    ...FB,
+                    fontSize: 13,
+                    fontWeight: 700,
+                    color: '#1E293B',
+                    letterSpacing: '-0.01em',
+                  }}>路径结果</span>
+                </div>
+                <div style={{
+                  ...FB,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: '#1E293B',
+                  marginBottom: 8,
+                }}>发现 <span style={{ ...NUM, color: '#0891b2', fontWeight: 700 }}>{pathResult.path_count}</span> 条路径</div>
+                {pathResult.message && (
+                  <div style={{
+                    ...FB,
+                    fontSize: 12,
+                    color: '#6B7280',
+                    marginBottom: 8,
+                  }}>{pathResult.message}</div>
+                )}
+                <div style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 6,
+                  maxHeight: 200,
+                  overflow: 'auto',
+                }}>
+                  {pathResult.paths?.map((path, i) => (
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 34 */
+                    <div key={i} style={{
+                      padding: '10px 12px',
+                      background: '#F9FAFB',
+                      borderRadius: 10,
+                    }}>
+                      <div style={{
+                        display: 'flex',
+                        flexWrap: 'wrap',
+                        gap: 4,
+                        alignItems: 'center',
+                      }}>
+                        {path.map((node, j) => (
+                          <React.Fragment key={j}>
+                            <Tag style={{
+                              color: NODE_COLORS[node.type || ''] || '#6b7280',
+                              border: `1px solid ${NODE_COLORS[node.type || ''] || '#6b7280'}25`,
+                              fontSize: 11,
+                              fontWeight: 500,
+                              margin: 0,
+                              borderRadius: 5,
+                              ...FB,
+                              background: `${NODE_COLORS[node.type || ''] || '#6b7280'}08`,
+                              padding: '1px 7px',
+                            }}>
+                              {node.value || node.id}
+                            </Tag>
+                            {j < path.length - 1 && (
+                              <span style={{ color: '#9CA3AF', fontSize: 11, ...FB }}>→</span>
+                            )}
+                          </React.Fragment>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+          {/* Community detection result */}
+          {commResult && (
+            <div style={{
+              background: '#FFFFFF',
+              border: '1px solid #E5E7EB',
+              borderRadius: 14,
+              overflow: 'hidden',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.01)',
+            }}>
+              <div style={{ height: 3, background: 'linear-gradient(90deg, #059669, #05966988)' }} />
+              <div style={{ padding: 18 }}>
+                <div style={{
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 35 */
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  marginBottom: 14,
+                }}>
+                  <div style={{
+                    width: 24,
+                    height: 24,
+                    borderRadius: 7,
+                    background: '#05966912',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}>
+                    <ExperimentOutlined style={{ color: '#059669', fontSize: 11 }} />
+                  </div>
+                  <span style={{
+                    ...FB,
+                    fontSize: 13,
+                    fontWeight: 700,
+                    color: '#1E293B',
+                    letterSpacing: '-0.01em',
+                  }}>社区发现</span>
+                </div>
+                <div style={{
+                  ...FB,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: '#1E293B',
+                  marginBottom: 6,
+                }}>发现 <span style={{ ...NUM, color: '#059669', fontWeight: 700 }}>{commResult.community_count}</span> 个社区</div>
+                <div style={{
+                  ...FB,
+                  fontSize: 11,
+                  color: '#9CA3AF',
+                  marginBottom: 12,
+                }}>算法: {commResult.algorithm}</div>
+                <div style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 10,
+                  maxHeight: 300,
+                  overflow: 'auto',
+                }}>
+                  {commResult.communities?.map((c, i) => (
+                    <div key={i} style={{
+                      padding: '12px 14px',
+                      background: '#F9FAFB',
+                      borderRadius: 10,
+                    }}>
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 36 */
+                      <div style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        marginBottom: 8,
+                      }}>
+                        <span style={{
+                          ...FB,
+                          fontSize: 12,
+                          fontWeight: 700,
+                          color: '#1E293B',
+                        }}>社区 #{i + 1}</span>
+                        <span style={{
+                          ...NUM,
+                          fontSize: 11,
+                          color: '#6B7280',
+                          fontWeight: 600,
+                        }}>{c.member_count} 成员</span>
+                      </div>
+                      <Progress
+                        percent={Math.min(100, Math.round(c.member_count / ((commResult.communities?.sort((a, b) => b.member_count - a.member_count)[0]?.member_count || 1)) * 100))}
+                        showInfo={false}
+                        strokeColor="#059669"
+                        trailColor="#E5E7EB"
+                        size="small"
+                      />
+                      <div style={{
+                        display: 'flex',
+                        flexWrap: 'wrap',
+                        gap: 4,
+                        marginTop: 8,
+                      }}>
+                        {c.members?.slice(0, 6).map((m, j) => (
+                          <Tag key={j} style={{
+                            color: '#374151',
+                            border: '1px solid #E5E7EB',
+                            fontSize: 11,
+                            margin: 0,
+                            borderRadius: 5,
+                            ...FB,
+                            background: '#FFFFFF',
+                            padding: '1px 7px',
+                          }}>{m.value}</Tag>
+                        ))}
+                        {c.member_count > 6 && (
+                          <span style={{
+                            ...NUM,
+                            fontSize: 11,
+                            color: '#9CA3AF',
+                            fontWeight: 600,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 37 */
+                          }}>+{c.member_count - 6}</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      {/* Path finding modal */}
+      <Modal
+        title={
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{
+              width: 4,
+              height: 22,
+              borderRadius: 2,
+              background: 'linear-gradient(180deg, #0891b2, #0891b288)',
+            }} />
+            <span style={{
+              ...FB,
+              fontWeight: 700,
+              fontSize: 16,
+              color: '#1E293B',
+              letterSpacing: '-0.01em',
+            }}>查找路径</span>
+          </div>
+        }
+        open={pathVisible}
+        onCancel={() => { setPathVisible(false); setPathResult(null); }}
+        footer={
+          <button
+            onClick={() => { setPathVisible(false); setPathResult(null); }}
+            style={{
+              padding: '7px 22px',
+              borderRadius: 9,
+              border: '1px solid #E5E7EB',
+              background: '#F3F4F6',
+              color: '#374151',
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: 'pointer',
+              ...FB,
+              transition: 'all 0.15s ease',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = '#E5E7EB'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = '#F3F4F6'; }}
+          >关闭</button>
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 38 */
+        }
+        width={520}
+        styles={{
+          content: {
+            borderRadius: 14,
+            background: '#FFFFFF',
+            border: '1px solid #E5E7EB',
+          },
+          header: {
+            background: '#FFFFFF',
+            borderBottom: '1px solid #F3F4F6',
+          },
+          body: {
+            background: '#FFFFFF',
+          },
+        }}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 18 }}>
+          <div style={{ display: 'flex', gap: 12 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{
+                ...FB,
+                fontSize: 12,
+                color: '#9CA3AF',
+                marginBottom: 6,
+                fontWeight: 500,
+              }}>源实体ID</div>
+              <Input
+                placeholder="输入源实体ID"
+                value={pathForm.sourceId}
+                onChange={e => setPathForm(p => ({ ...p, sourceId: e.target.value }))}
+                style={{ borderRadius: 9 }}
+              />
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{
+                ...FB,
+                fontSize: 12,
+                color: '#9CA3AF',
+                marginBottom: 6,
+                fontWeight: 500,
+              }}>目标实体ID</div>
+              <Input
+                placeholder="输入目标实体ID"
+                value={pathForm.targetId}
+                onChange={e => setPathForm(p => ({ ...p, targetId: e.target.value }))}
+                style={{ borderRadius: 9 }}
+              />
+            </div>
+          </div>
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 39 */
+          <button
+            onClick={handleFindPath}
+            disabled={pathLoading}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 7,
+              padding: '9px 22px',
+              borderRadius: 9,
+              border: 'none',
+              background: 'linear-gradient(135deg, #0891b2 0%, #0d9488 100%)',
+              color: '#FFFFFF',
+              fontSize: 14,
+              fontWeight: 600,
+              cursor: pathLoading ? 'not-allowed' : 'pointer',
+              opacity: pathLoading ? 0.65 : 1,
+              transition: 'all 0.2s ease',
+              ...FB,
+              boxShadow: '0 1px 3px rgba(8,145,178,0.25)',
+            }}
+            onMouseEnter={e => { if (!pathLoading) { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 3px 8px rgba(8,145,178,0.3)'; } }}
+            onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 1px 3px rgba(8,145,178,0.25)'; }}
+          >
+            <NodeIndexOutlined style={{ fontSize: 13 }} />
+            {pathLoading ? '查找中...' : '查找路径'}
+          </button>
+          {pathResult && (
+            <div style={{
+              padding: 16,
+              background: '#F9FAFB',
+              borderRadius: 12,
+              border: '1px solid #E5E7EB',
+              maxHeight: 300,
+              overflow: 'auto',
+            }}>
+              <div style={{
+                ...FB,
+                fontSize: 12,
+                fontWeight: 700,
+                color: '#1E293B',
+                marginBottom: 12,
+              }}>发现 <span style={{ ...NUM, color: '#0891b2' }}>{pathResult.path_count}</span> 条路径</div>
+              {pathResult.paths?.map((path, i) => (
+                <div key={i} style={{
+                  padding: '10px 12px',
+                  background: '#FFFFFF',
+                  borderRadius: 10,
+                  border: '1px solid #E5E7EB',
+                  marginBottom: 6,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 40 */
+                }}>
+                  <div style={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: 4,
+                    alignItems: 'center',
+                  }}>
+                    {path.map((node, j) => (
+                      <React.Fragment key={j}>
+                        <Tag style={{
+                          color: NODE_COLORS[node.type || ''] || '#6b7280',
+                          border: `1px solid ${NODE_COLORS[node.type || ''] || '#6b7280'}25`,
+                          fontSize: 11,
+                          fontWeight: 500,
+                          margin: 0,
+                          borderRadius: 5,
+                          ...FB,
+                          background: `${NODE_COLORS[node.type || ''] || '#6b7280'}08`,
+                          padding: '1px 7px',
+                        }}>
+                          {node.value || node.id}
+                        </Tag>
+                        {j < path.length - 1 && (
+                          <span style={{ color: '#9CA3AF', fontSize: 11, ...FB }}>→</span>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Modal>
+    </div>
+  );
+};
+export default Graph;
+// ============================================================
+// File: pages/Entities.tsx
+// ============================================================
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import {
+  Button, Modal, Form, Input, Select, Space, Spin, Empty,
+  Popconfirm, Tooltip, Pagination,
+} from 'antd';
+import {
+  DeleteOutlined, LinkOutlined, SearchOutlined,
+  UserOutlined, GlobalOutlined, ToolOutlined, MessageOutlined,
+  AppstoreOutlined, PlusOutlined, ReloadOutlined,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 41 */
+} from '@ant-design/icons';
+import { Treemap, ResponsiveContainer, Tooltip as RTooltip } from 'recharts';
+import { graphApi, getErrorMessage } from '../services/api';
+import { useAntdMessage } from '../utils/hooks';
+import gsap from 'gsap';
+import { ANIM_CONFIG } from '../config/animation';
+const ACCENT_BLUE = '#6366F1';
+const ACCENT_PINK = '#EC4899';
+const ACCENT_AMBER = '#F59E0B';
+const ACCENT_GREEN = '#10B981';
+const ACCENT_CYAN = '#06B6D4';
+const TEXT_PRIMARY = '#1E293B';
+const TEXT_SECONDARY = '#374151';
+const TEXT_MUTED = '#6B7280';
+const TEXT_LIGHT = '#9CA3AF';
+const BORDER_COLOR = '#E5E7EB';
+const BORDER_LIGHT = '#F1F5F9';
+const SURFACE_BG = '#F8FAFC';
+const WHITE = '#FFFFFF';
+const DISPLAY_FONT = '"Clash Display", "DM Sans", sans-serif';
+const BODY_FONT = '"DM Sans", sans-serif';
+const NUM_STYLE: React.CSSProperties = {
+  fontFamily: BODY_FONT,
+  fontVariantNumeric: 'tabular-nums',
+};
+const TREEMAP_COLORS = [
+  '#818CF8', '#F472B6', '#FBBF24', '#34D399', '#22D3EE',
+  '#A78BFA', '#FB923C', '#F87171', '#2DD4BF', '#60A5FA',
+  '#C084FC', '#FCA5A5', '#9CA3AF', '#6EE7B7', '#FDA4AF', '#9CA3AF',
+];
+const TreemapContent = (props: any) => {
+  const { x, y, width, height, name, value, index } = props;
+  if (!width || !height || width < 20 || height < 16) return null;
+  return (
+    <g>
+      <rect x={x} y={y} width={width} height={height} fill={TREEMAP_COLORS[index % TREEMAP_COLORS.length]} fillOpacity={0.75} stroke={WHITE} strokeWidth={2} rx={4} />
+      {width > 45 && height > 32 && (
+        <>
+          <text x={x + 6} y={y + 16} fill={WHITE} fontSize={11} fontWeight="600" fontFamily={BODY_FONT}>{name}</text>
+          <text x={x + 6} y={y + 28} fill="rgba(255,255,255,0.8)" fontSize={10} style={NUM_STYLE}>{value}</text>
+        </>
+      )}
+    </g>
+  );
+};
+const ENTITY_TYPES = [
+  { value: 'ip', label: 'IP地址', icon: <GlobalOutlined />, color: '#6366F1' },
+  { value: 'account', label: '账号', icon: <UserOutlined />, color: '#EC4899' },
+  { value: 'blacktalk', label: '黑话', icon: <MessageOutlined />, color: '#F59E0B' },
+  { value: 'service', label: '服务', color: '#10B981' },
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 42 */
+  { value: 'crypto_wallet', label: '钱包', color: '#06B6D4' },
+  { value: 'tool', label: '工具', icon: <ToolOutlined />, color: '#8B5CF6' },
+  { value: 'person', label: '人员', color: '#14B8A6' },
+  { value: 'domain', label: '域名', icon: <GlobalOutlined />, color: '#3B82F6' },
+  { value: 'malware', label: '恶意软件', color: '#EF4444' },
+  { value: 'organization', label: '组织', color: '#8B5CF6' },
+  { value: 'email', label: '邮箱', color: '#F97316' },
+  { value: 'url', label: '链接', icon: <GlobalOutlined />, color: '#0EA5E9' },
+  { value: 'hash', label: '哈希', color: '#9CA3AF' },
+  { value: 'phone', label: '电话', color: '#10B981' },
+  { value: 'payment_method', label: '支付', color: '#E11D48' },
+  { value: 'other', label: '其他', color: '#9CA3AF' },
+];
+const Entities: React.FC = () => {
+  const message = useAntdMessage();
+  const [entities, setEntities] = useState<Record<string, unknown>[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState<string | undefined>(undefined);
+  const [stats, setStats] = useState<Record<string, unknown>>({});
+  const [addOpen, setAddOpen] = useState(false);
+  const [entityPage, setEntityPage] = useState(1);
+  const ENTITY_PAGE_SIZE = 12;
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [relateOpen, setRelateOpen] = useState(false);
+  const [selectedEntity, setSelectedEntity] = useState<Record<string, unknown> | null>(null);
+  const [addForm] = Form.useForm();
+  const [relateForm] = Form.useForm();
+  const headerRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const [entRes, statsRes] = await Promise.allSettled([
+        graphApi.listEntities({ entity_type: typeFilter, search: search || undefined }),
+        graphApi.getStats(),
+      ]);
+      if (entRes.status === 'fulfilled') {
+        const d = entRes.value as unknown as Record<string, unknown>;
+        setEntities((d?.items || []) as Record<string, unknown>[]);
+      } else { setEntities([]); }
+      if (statsRes.status === 'fulfilled') setStats(statsRes.value as unknown as Record<string, unknown>);
+    } catch { setEntities([]); } finally { setLoading(false); }
+  };
+  useEffect(() => { fetchData(); }, [search, typeFilter]);
+  useEffect(() => {
+    if (headerRef.current) {
+      gsap.fromTo(headerRef.current, { y: 12, opacity: 0 }, { y: 0, opacity: 1, duration: 0.4, ease: 'power2.out' });
+    }
+  }, []);
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 43 */
+  useEffect(() => {
+    if (listRef.current) {
+      const rows = listRef.current.querySelectorAll('.entity-card');
+      gsap.fromTo(rows, { y: 6, opacity: 0 }, { y: 0, opacity: 1, duration: 0.25, stagger: 0.02, ease: 'power2.out' });
+    }
+  }, [entities]);
+  const getEntityId = (e: Record<string, unknown>) => String(e.id || e.entity_id);
+  const entityTypes = (stats.entity_types || {}) as Record<string, number>;
+  const kpiStats = useMemo(() => [
+    { label: '实体总数', value: Number(stats.node_count || stats.total_entities || entities.length), color: ACCENT_BLUE },
+    { label: 'IP', value: Number(entityTypes.ip || entities.filter(e => String(e.type) === 'ip').length), color: ACCENT_PINK },
+    { label: '账号', value: Number(entityTypes.account || entities.filter(e => String(e.type) === 'account').length), color: ACCENT_AMBER },
+    { label: '黑话', value: Number(entityTypes.blacktalk || entities.filter(e => String(e.type) === 'blacktalk').length), color: ACCENT_GREEN },
+  ], [stats, entities]);
+  const typeCounts = useMemo(() => {
+    const map: Record<string, number> = {};
+    entities.forEach(e => { const t = String(e.type || 'other'); map[t] = (map[t] || 0) + 1; });
+    return map;
+  }, [entities]);
+  const typeDist = useMemo(() => {
+    const map: Record<string, number> = {};
+    entities.forEach(e => { const t = String(e.type || 'other'); map[t] = (map[t] || 0) + 1; });
+    return Object.entries(map).map(([name, value]) => ({
+      name: ENTITY_TYPES.find(t => t.value === name)?.label || name,
+      value,
+    }));
+  }, [entities]);
+  const maxMentionCount = useMemo(() => {
+    const counts = entities.map(e => {
+      const mc = Number(e.mention_count || 0);
+      if (mc > 0) return mc;
+      const srcIds = e.source_ids as unknown[];
+      return srcIds ? srcIds.length : 0;
+    });
+    return Math.max(...counts, 1);
+  }, [entities]);
+  const handleAdd = async () => {
+    try {
+      const values = await addForm.validateFields();
+      await graphApi.addEntity(String(values.type), String(values.name || values.value), String(values.description || ''), 0.8);
+      message.success('实体已添加');
+      setAddOpen(false);
+      addForm.resetFields();
+      fetchData();
+    } catch (err: unknown) {
+      if (err && typeof err === 'object' && 'errorFields' in err) return;
+      message.error(getErrorMessage(err));
+    }
+  };
+  const handleRelate = async () => {
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 44 */
+    if (!selectedEntity) return;
+    try {
+      const values = await relateForm.validateFields();
+      const id = getEntityId(selectedEntity);
+      await graphApi.addRelation(id, String(values.target_id), String(values.relationship_type), 0.8, String(values.description || ''));
+      message.success('关联已创建');
+      setRelateOpen(false);
+      relateForm.resetFields();
+    } catch (err: unknown) {
+      if (err && typeof err === 'object' && 'errorFields' in err) return;
+      message.error(getErrorMessage(err));
+    }
+  };
+  const handleDelete = async (id: string) => {
+    setDeletingId(id);
+    try { await graphApi.deleteEntity(id); message.success('实体已删除'); fetchData(); } catch (err) { message.error(getErrorMessage(err)); }
+    finally { setDeletingId(null); }
+  };
+  const tooltipStyle: React.CSSProperties = { background: WHITE, border: `1px solid ${BORDER_COLOR}`, borderRadius: 8, fontSize: 12, color: TEXT_PRIMARY, padding: '8px 12px', ...NUM_STYLE, boxShadow: '0 2px 8px rgba(0,0,0,0.08)' };
+  const filterPillTypes = ENTITY_TYPES.filter(t => typeCounts[t.value]);
+  return (
+    <div style={{ padding: 0, background: SURFACE_BG, minHeight: '100vh', overflowX: 'hidden' }}>
+      <style>{`
+        @import url('https://,500,600,700,800&display=swap');
+        .entity-card {
+          transition: transform 0.2s cubic-bezier(0.4,0,0.2,1), box-shadow 0.2s cubic-bezier(0.4,0,0.2,1);
+        }
+        .entity-card:hover {
+          transform: translateY(-4px);
+          box-shadow: 0 12px 32px rgba(0,0,0,0.08), 0 2px 8px rgba(0,0,0,0.04);
+        }
+        .entity-card .card-actions {
+          opacity: 0;
+          transition: opacity 0.15s ease;
+        }
+        .entity-card:hover .card-actions {
+          opacity: 1;
+        }
+        .entity-filter-pill {
+          transition: all 0.18s cubic-bezier(0.4,0,0.2,1);
+          cursor: pointer;
+          user-select: none;
+        }
+        .entity-filter-pill:hover {
+          transform: translateY(-1px);
+          box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }
+        .entity-filter-pill:active {
+          transform: translateY(0);
+        }
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 45 */
+        .entity-search-input .ant-input {
+          border-radius: 20px !important;
+          background: ${WHITE} !important;
+          font-family: ${BODY_FONT} !important;
+          font-size: 13px !important;
+          color: ${TEXT_PRIMARY} !important;
+          height: 36px !important;
+        }
+        .entity-search-input .ant-input::placeholder {
+          color: ${TEXT_LIGHT} !important;
+        }
+        .entity-search-input .ant-input-affix-wrapper {
+          border-radius: 20px !important;
+          background: ${WHITE} !important;
+          border: 1.5px solid ${BORDER_COLOR} !important;
+          height: 40px !important;
+          padding: 0 16px !important;
+        }
+        .entity-search-input .ant-input-affix-wrapper:hover {
+          border-color: ${ACCENT_BLUE} !important;
+        }
+        .entity-search-input .ant-input-affix-wrapper:focus-within {
+          border-color: ${ACCENT_BLUE} !important;
+          box-shadow: 0 0 0 3px rgba(99,102,241,0.1) !important;
+        }
+        .entity-search-input .ant-input-affix-wrapper .ant-input {
+          background: transparent !important;
+          color: ${TEXT_PRIMARY} !important;
+        }
+        .entity-search-input .ant-input-prefix {
+          margin-right: 8px !important;
+          color: ${TEXT_LIGHT} !important;
+        }
+        .entity-modal .ant-modal-content {
+          border-radius: 16px !important;
+          padding: 0 !important;
+          overflow: hidden;
+          background: ${WHITE} !important;
+          border: 1px solid ${BORDER_COLOR} !important;
+          box-shadow: 0 20px 60px rgba(0,0,0,0.12) !important;
+        }
+        .entity-modal .ant-modal-header {
+          border-radius: 16px 16px 0 0 !important;
+          border-bottom: 1px solid ${BORDER_LIGHT} !important;
+          padding: 20px 24px !important;
+          margin: 0 !important;
+          background: #FAFBFC !important;
+        }
+        .entity-modal .ant-modal-title {
+          font-family: ${DISPLAY_FONT} !important;
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 46 */
+          font-size: 18px !important;
+          font-weight: 700 !important;
+          color: ${TEXT_PRIMARY} !important;
+        }
+        .entity-modal .ant-modal-body {
+          padding: 24px !important;
+          background: ${WHITE} !important;
+        }
+        .entity-modal .ant-modal-footer {
+          border-top: 1px solid ${BORDER_LIGHT} !important;
+          padding: 16px 24px !important;
+          margin: 0 !important;
+          background: #FAFBFC !important;
+        }
+        .entity-modal .ant-btn {
+          border-radius: 10px !important;
+          font-family: ${BODY_FONT} !important;
+          font-size: 13px !important;
+          font-weight: 600 !important;
+          height: 38px !important;
+          padding: 0 22px !important;
+          background: ${WHITE} !important;
+          border-color: #D1D5DB !important;
+          color: ${TEXT_PRIMARY} !important;
+        }
+        .entity-modal .ant-btn:hover {
+          border-color: ${ACCENT_BLUE} !important;
+          color: ${ACCENT_BLUE} !important;
+        }
+        .entity-modal .ant-btn-primary {
+          background: ${ACCENT_BLUE} !important;
+          border-color: ${ACCENT_BLUE} !important;
+          color: #FFFFFF !important;
+          font-weight: 700 !important;
+        }
+        .entity-modal .ant-btn-primary:hover {
+          background: #4F46E5 !important;
+          border-color: #4F46E5 !important;
+        }
+        .entity-modal .ant-form-item-label > label {
+          font-family: ${BODY_FONT} !important;
+          font-size: 13px !important;
+          color: ${TEXT_MUTED} !important;
+          font-weight: 500 !important;
+        }
+        .entity-modal .ant-input,
+        .entity-modal .ant-select-selector,
+        .entity-modal .ant-input-affix-wrapper {
+          border-radius: 10px !important;
+          background: ${WHITE} !important;
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 47 */
+          border-color: ${BORDER_COLOR} !important;
+          color: ${TEXT_PRIMARY} !important;
+        }
+        .entity-modal .ant-input::placeholder {
+          color: ${TEXT_LIGHT} !important;
+        }
+        .entity-modal .ant-input:hover,
+        .entity-modal .ant-select-selector:hover,
+        .entity-modal .ant-input-affix-wrapper:hover {
+          border-color: ${ACCENT_BLUE} !important;
+        }
+        .entity-modal .ant-input:focus,
+        .entity-modal .ant-input-focused,
+        .entity-modal .ant-select-selector:focus,
+        .entity-modal .ant-input-affix-wrapper:focus {
+          border-color: ${ACCENT_BLUE} !important;
+          box-shadow: 0 0 0 2px rgba(99,102,241,0.1) !important;
+        }
+        .entity-modal .ant-select-selection-item {
+          color: ${TEXT_PRIMARY} !important;
+        }
+        .entity-modal .ant-select-arrow {
+          color: ${TEXT_MUTED} !important;
+        }
+        .entity-modal .ant-input-textarea textarea {
+          background: ${WHITE} !important;
+          color: ${TEXT_PRIMARY} !important;
+          border-color: ${BORDER_COLOR} !important;
+          border-radius: 10px !important;
+        }
+        .entity-modal .ant-input-textarea textarea::placeholder {
+          color: ${TEXT_LIGHT} !important;
+        }
+        .entity-modal .ant-input-textarea textarea:hover {
+          border-color: ${ACCENT_BLUE} !important;
+        }
+        .entity-modal .ant-input-textarea textarea:focus {
+          border-color: ${ACCENT_BLUE} !important;
+          box-shadow: 0 0 0 2px rgba(99,102,241,0.1) !important;
+        }
+        .entity-pagination .ant-pagination-item {
+          border-radius: 8px !important;
+          font-family: ${BODY_FONT} !important;
+          font-size: 13px !important;
+          background: ${WHITE} !important;
+          border-color: ${BORDER_COLOR} !important;
+        }
+        .entity-pagination .ant-pagination-item a {
+          color: ${TEXT_PRIMARY} !important;
+        }
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 48 */
+        .entity-pagination .ant-pagination-item:hover {
+          border-color: ${ACCENT_BLUE} !important;
+        }
+        .entity-pagination .ant-pagination-item:hover a {
+          color: ${ACCENT_BLUE} !important;
+        }
+        .entity-pagination .ant-pagination-item-active {
+          background: ${ACCENT_BLUE} !important;
+          border-color: ${ACCENT_BLUE} !important;
+        }
+        .entity-pagination .ant-pagination-item-active a {
+          color: #FFFFFF !important;
+          font-weight: 700 !important;
+        }
+        .entity-pagination .ant-pagination-prev .ant-pagination-item-link,
+        .entity-pagination .ant-pagination-next .ant-pagination-item-link {
+          border-radius: 8px !important;
+          background: ${WHITE} !important;
+          border-color: ${BORDER_COLOR} !important;
+          color: ${TEXT_PRIMARY} !important;
+        }
+        .entity-pagination .ant-pagination-prev .ant-pagination-item-link:hover,
+        .entity-pagination .ant-pagination-next .ant-pagination-item-link:hover {
+          border-color: ${ACCENT_BLUE} !important;
+          color: ${ACCENT_BLUE} !important;
+        }
+        .entity-pagination .ant-pagination-disabled .ant-pagination-item-link {
+          opacity: 0.4 !important;
+        }
+        .ant-select-dropdown {
+          background: ${WHITE} !important;
+          border: 1px solid ${BORDER_COLOR} !important;
+        }
+        .ant-select-dropdown .ant-select-item {
+          color: ${TEXT_PRIMARY} !important;
+        }
+        .ant-select-dropdown .ant-select-item-option-active {
+          background: #F3F4F6 !important;
+        }
+        .ant-select-dropdown .ant-select-item-option-selected {
+          background: rgba(99,102,241,0.08) !important;
+          color: ${ACCENT_BLUE} !important;
+        }
+        .ant-popover-inner {
+          background: ${WHITE} !important;
+          border: 1px solid ${BORDER_COLOR} !important;
+        }
+        .ant-popconfirm-description {
+          color: ${TEXT_PRIMARY} !important;
+        }
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 49 */
+        .ant-popconfirm-buttons .ant-btn {
+          background: ${WHITE} !important;
+          border-color: #D1D5DB !important;
+          color: ${TEXT_PRIMARY} !important;
+        }
+        .ant-popconfirm-buttons .ant-btn-primary {
+          background: #e5484d !important;
+          border-color: #e5484d !important;
+          color: #fff !important;
+        }
+      `}</style>
+      <div ref={headerRef} style={{
+        padding: '32px 40px 28px',
+        background: WHITE,
+        borderBottom: `1px solid ${BORDER_LIGHT}`,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+            <div style={{
+              width: 4,
+              height: 52,
+              borderRadius: 2,
+              background: `linear-gradient(180deg, ${ACCENT_BLUE}, ${ACCENT_PINK})`,
+              flexShrink: 0,
+            }} />
+            <div>
+              <h1 style={{
+                fontFamily: DISPLAY_FONT,
+                fontSize: 26,
+                fontWeight: 800,
+                color: TEXT_PRIMARY,
+                margin: 0,
+                lineHeight: 1.2,
+                letterSpacing: -0.5,
+              }}>
+                实体档案
+              </h1>
+              <p style={{
+                fontFamily: BODY_FONT,
+                fontSize: 13,
+                color: TEXT_MUTED,
+                margin: '4px 0 0',
+                lineHeight: 1.4,
+              }}>
+                黑产实体提取与管理
+              </p>
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            {kpiStats.map((s) => (
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 50 */
+              <div
+                key={s.label}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '8px 16px',
+                  borderRadius: 12,
+                  background: `${s.color}08`,
+                  border: `1px solid ${s.color}15`,
+                }}
+              >
+                <div style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: 3,
+                  background: s.color,
+                  flexShrink: 0,
+                }} />
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                  <span style={{
+                    fontFamily: BODY_FONT,
+                    fontSize: 10,
+                    color: TEXT_LIGHT,
+                    fontWeight: 500,
+                    lineHeight: 1,
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.5,
+                  }}>
+                    {s.label}
+                  </span>
+                  <span style={{
+                    fontFamily: BODY_FONT,
+                    fontSize: 18,
+                    fontWeight: 700,
+                    color: s.color,
+                    lineHeight: 1.2,
+                    ...NUM_STYLE,
+                  }}>
+                    {s.value}
+                  </span>
+                </div>
+              </div>
+            ))}
+            <div style={{ width: 1, height: 36, background: BORDER_COLOR, margin: '0 4px' }} />
+            <Button
+              onClick={fetchData}
+              icon={<ReloadOutlined />}
+              style={{
+                borderRadius: 10,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 51 */
+                fontFamily: BODY_FONT,
+                fontWeight: 600,
+                height: 38,
+                fontSize: 13,
+                color: TEXT_MUTED,
+                border: `1px solid ${BORDER_COLOR}`,
+              }}
+            >
+              刷新
+            </Button>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={() => setAddOpen(true)}
+              style={{
+                borderRadius: 10,
+                fontFamily: BODY_FONT,
+                fontWeight: 700,
+                height: 38,
+                fontSize: 13,
+                background: `linear-gradient(135deg, ${ACCENT_BLUE}, #4F46E5)`,
+                borderColor: ACCENT_BLUE,
+                boxShadow: `0 2px 8px ${ACCENT_BLUE}30`,
+              }}
+            >
+              添加实体
+            </Button>
+          </div>
+        </div>
+      </div>
+      <div style={{ padding: '20px 40px' }}>
+        <div style={{
+          background: WHITE,
+          borderRadius: 14,
+          border: `1px solid ${BORDER_COLOR}`,
+          boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+          padding: '14px 20px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 16,
+        }}>
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            flexWrap: 'wrap',
+            flex: 1,
+          }}>
+            <div
+              className="entity-filter-pill"
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 52 */
+              onClick={() => setTypeFilter(undefined)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '7px 16px',
+                borderRadius: 20,
+                background: !typeFilter ? ACCENT_BLUE : '#F3F4F6',
+                color: !typeFilter ? '#FFFFFF' : TEXT_SECONDARY,
+                border: `1.5px solid ${!typeFilter ? ACCENT_BLUE : 'transparent'}`,
+                fontFamily: BODY_FONT,
+                fontSize: 13,
+                fontWeight: !typeFilter ? 700 : 500,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <AppstoreOutlined style={{ fontSize: 12 }} />
+              全部
+              <span style={{
+                ...NUM_STYLE,
+                fontSize: 11,
+                fontWeight: 700,
+                background: !typeFilter ? 'rgba(255,255,255,0.25)' : `${TEXT_MUTED}20`,
+                color: !typeFilter ? 'rgba(255,255,255,0.9)' : TEXT_MUTED,
+                padding: '1px 8px',
+                borderRadius: 10,
+                marginLeft: 2,
+              }}>
+                {entities.length}
+              </span>
+            </div>
+            {filterPillTypes.map((t) => {
+              const isActive = typeFilter === t.value;
+              const count = typeCounts[t.value] || 0;
+              return (
+                <div
+                  key={t.value}
+                  className="entity-filter-pill"
+                  onClick={() => setTypeFilter(isActive ? undefined : t.value)}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '7px 16px',
+                    borderRadius: 20,
+                    background: isActive ? t.color : '#F3F4F6',
+                    color: isActive ? '#FFFFFF' : TEXT_SECONDARY,
+                    border: `1.5px solid ${isActive ? t.color : 'transparent'}`,
+                    fontFamily: BODY_FONT,
+                    fontSize: 13,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 53 */
+                    fontWeight: isActive ? 700 : 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {t.icon && <span style={{ fontSize: 12, display: 'inline-flex', alignItems: 'center' }}>{t.icon}</span>}
+                  {t.label}
+                  <span style={{
+                    ...NUM_STYLE,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    background: isActive ? 'rgba(255,255,255,0.25)' : `${t.color}15`,
+                    color: isActive ? 'rgba(255,255,255,0.9)' : t.color,
+                    padding: '1px 8px',
+                    borderRadius: 10,
+                    marginLeft: 2,
+                  }}>
+                    {count}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          <Input
+            className="entity-search-input"
+            placeholder="搜索实体..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            allowClear
+            style={{ width: 240, flexShrink: 0 }}
+            prefix={<SearchOutlined style={{ fontSize: 14 }} />}
+          />
+        </div>
+      </div>
+      {typeDist.length > 0 && (
+        <div style={{ padding: '0 40px 20px' }}>
+          <div style={{
+            background: WHITE,
+            borderRadius: 14,
+            border: `1px solid ${BORDER_COLOR}`,
+            overflow: 'hidden',
+            boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+          }}>
+            <div style={{
+              height: 3,
+              background: `linear-gradient(90deg, ${ACCENT_BLUE}, ${ACCENT_PINK}, ${ACCENT_AMBER}, ${ACCENT_GREEN}, ${ACCENT_CYAN})`,
+            }} />
+            <div style={{
+              padding: '16px 20px',
+              borderBottom: `1px solid ${BORDER_LIGHT}`,
+              display: 'flex',
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 54 */
+              alignItems: 'center',
+              justifyContent: 'space-between',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 8,
+                  background: `${ACCENT_BLUE}10`,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}>
+                  <AppstoreOutlined style={{ fontSize: 14, color: ACCENT_BLUE }} />
+                </div>
+                <span style={{
+                  fontFamily: DISPLAY_FONT,
+                  fontSize: 16,
+                  fontWeight: 700,
+                  color: TEXT_PRIMARY,
+                }}>
+                  实体类型分布
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
+                {typeDist.map((d, i) => (
+                  <div key={d.name} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: 3, background: TREEMAP_COLORS[i % TREEMAP_COLORS.length] }} />
+                    <span style={{ color: TEXT_MUTED, fontSize: 12, fontFamily: BODY_FONT, fontWeight: 500 }}>{d.name}</span>
+                    <span style={{ color: TEXT_PRIMARY, fontSize: 12, ...NUM_STYLE, fontWeight: 600 }}>{d.value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ padding: '8px 0 0' }}>
+              <ResponsiveContainer width="100%" height={200}>
+                <Treemap
+                  data={typeDist}
+                  dataKey="value"
+                  nameKey="name"
+                  stroke="#FFFFFF"
+                  fill={ACCENT_BLUE}
+                  aspectRatio={4 / 3}
+                  content={<TreemapContent />}
+                >
+                  <RTooltip contentStyle={tooltipStyle} formatter={(val: number, name: string) => [val, name]} />
+                </Treemap>
+              </ResponsiveContainer>
+            </div>
+          </div>
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 55 */
+        </div>
+      )}
+      <div style={{ padding: '0 40px 32px' }}>
+        {loading ? (
+          <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spin /></div>
+        ) : entities.length === 0 ? (
+          <div style={{
+            padding: '80px 0',
+            textAlign: 'center',
+            background: WHITE,
+            borderRadius: 14,
+            border: `1px solid ${BORDER_COLOR}`,
+          }}>
+            <Empty description={<span style={{ color: TEXT_MUTED, fontFamily: BODY_FONT, fontSize: 13 }}>暂无实体，点击「添加实体」开始管理</span>}>
+              <Button
+                type="primary"
+                icon={<PlusOutlined />}
+                onClick={() => setAddOpen(true)}
+                style={{
+                  borderRadius: 10,
+                  fontFamily: BODY_FONT,
+                  fontWeight: 700,
+                  height: 38,
+                  background: ACCENT_BLUE,
+                  borderColor: ACCENT_BLUE,
+                }}
+              >
+                添加实体
+              </Button>
+            </Empty>
+          </div>
+        ) : (
+          <>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              marginBottom: 18,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 8,
+                  background: `${ACCENT_BLUE}10`,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}>
+                  <AppstoreOutlined style={{ fontSize: 14, color: ACCENT_BLUE }} />
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 56 */
+                </div>
+                <span style={{
+                  fontFamily: DISPLAY_FONT,
+                  fontSize: 16,
+                  fontWeight: 700,
+                  color: TEXT_PRIMARY,
+                }}>
+                  实体列表
+                </span>
+              </div>
+              <span style={{
+                ...NUM_STYLE,
+                fontSize: 13,
+                color: TEXT_LIGHT,
+                fontFamily: BODY_FONT,
+              }}>
+                {entities.length} 条记录
+              </span>
+            </div>
+            <div ref={listRef} style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))',
+              gap: 16,
+            }}>
+              {entities.slice((entityPage - 1) * ENTITY_PAGE_SIZE, entityPage * ENTITY_PAGE_SIZE).map((entity) => {
+                const type = String(entity.type || 'other');
+                const typeCfg = ENTITY_TYPES.find(t => t.value === type);
+                const color = typeCfg?.color || '#9CA3AF';
+                const label = typeCfg?.label || type;
+                const id = getEntityId(entity);
+                const rawMention = Number(entity.mention_count || 0);
+                const mentionCount = rawMention > 0 ? rawMention : ((entity.source_ids as unknown[])?.length || 0);
+                const mentionPct = Math.min((mentionCount / maxMentionCount) * 100, 100);
+                const desc = String(entity.context || entity.description || '');
+                return (
+                  <div
+                    key={id}
+                    className="entity-card"
+                    style={{
+                      background: WHITE,
+                      borderRadius: 12,
+                      border: `1px solid ${BORDER_COLOR}`,
+                      borderTop: `3px solid ${color}`,
+                      overflow: 'hidden',
+                      cursor: 'default',
+                      position: 'relative',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
+                    }}
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 57 */
+                  >
+                    <div style={{ padding: '16px 18px 0' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{
+                            fontFamily: BODY_FONT,
+                            fontSize: 16,
+                            fontWeight: 700,
+                            color: TEXT_PRIMARY,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                            lineHeight: 1.4,
+                          }}>
+                            {String(entity.name || entity.value || '—')}
+                          </div>
+                        </div>
+                        <Space size={2} className="card-actions" style={{ flexShrink: 0, marginLeft: 8 }}>
+                          <Tooltip title="关联">
+                            <Button
+                              type="text"
+                              size="small"
+                              icon={<LinkOutlined />}
+                              onClick={() => { setSelectedEntity(entity); setRelateOpen(true); }}
+                              style={{ color: TEXT_MUTED, fontSize: 13, borderRadius: 8, width: 30, height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                            />
+                          </Tooltip>
+                          <Popconfirm title="确认删除？" onConfirm={() => handleDelete(id)} okText="删除" cancelText="取消" okButtonProps={{ danger: true }}>
+                            <Tooltip title="删除">
+                              <Button type="text" size="small" icon={<DeleteOutlined />} danger loading={deletingId === id} style={{ fontSize: 13, borderRadius: 8, width: 30, height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center' }} />
+                            </Tooltip>
+                          </Popconfirm>
+                        </Space>
+                      </div>
+                      <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 4,
+                          padding: '3px 10px',
+                          borderRadius: 6,
+                          background: `${color}10`,
+                          color: color,
+                          fontFamily: BODY_FONT,
+                          fontSize: 11,
+                          fontWeight: 600,
+                        }}>
+                          {typeCfg?.icon && <span style={{ fontSize: 10, display: 'inline-flex', alignItems: 'center' }}>{typeCfg.icon}</span>}
+                          {label}
+                        </span>
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 58 */
+                      </div>
+                    </div>
+                    <div style={{ padding: '8px 18px 0' }}>
+                      <div style={{
+                        fontFamily: BODY_FONT,
+                        fontSize: 13,
+                        color: desc ? TEXT_MUTED : TEXT_LIGHT,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        lineHeight: 1.5,
+                        fontStyle: desc ? 'normal' : 'italic',
+                      }}>
+                        {desc || '暂无描述'}
+                      </div>
+                    </div>
+                    <div style={{
+                      margin: '12px 18px 0',
+                      padding: '10px 0 14px',
+                      borderTop: `1px solid ${BORDER_LIGHT}`,
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                        <span style={{
+                          fontSize: 11,
+                          color: TEXT_LIGHT,
+                          fontFamily: BODY_FONT,
+                          fontWeight: 500,
+                          letterSpacing: 0.3,
+                        }}>
+                          提及次数
+                        </span>
+                        <span style={{
+                          fontSize: 14,
+                          fontWeight: 700,
+                          color: color,
+                          ...NUM_STYLE,
+                        }}>
+                          {mentionCount}
+                        </span>
+                      </div>
+                      <div style={{
+                        height: 4,
+                        borderRadius: 2,
+                        background: BORDER_LIGHT,
+                        overflow: 'hidden',
+                      }}>
+                        <div style={{
+                          height: '100%',
+                          borderRadius: 2,
+                          background: `linear-gradient(90deg, ${color}, ${color}BB)`,
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 59 */
+                          width: `${mentionPct}%`,
+                          transition: 'width 0.3s ease',
+                        }} />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {entities.length > ENTITY_PAGE_SIZE && (
+              <div className="entity-pagination" style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 24 }}>
+                <Pagination
+                  current={entityPage}
+                  pageSize={ENTITY_PAGE_SIZE}
+                  total={entities.length}
+                  onChange={setEntityPage}
+                  size="small"
+                  showTotal={t => `共 ${t} 条`}
+                />
+              </div>
+            )}
+          </>
+        )}
+      </div>
+      <Modal
+        className="entity-modal"
+        open={addOpen}
+        onCancel={() => { setAddOpen(false); addForm.resetFields(); }}
+        onOk={handleAdd}
+        width={520}
+        okText="添加"
+        cancelText="取消"
+        title="添加实体"
+        styles={{ content: { borderRadius: 16 }, mask: { borderRadius: 16 } }}
+      >
+        <Form form={addForm} layout="vertical" style={{ marginTop: 16 }}>
+          <Form.Item name="name" label="实体名称" rules={[{ required: true, message: '请输入实体名称' }]}>
+            <Input placeholder="例如: 料卡、洗钱通道" style={{ borderRadius: 10 }} />
+          </Form.Item>
+          <Form.Item name="type" label="实体类型" rules={[{ required: true, message: '请选择类型' }]}>
+            <Select options={ENTITY_TYPES.map(t => ({ value: t.value, label: t.label }))} placeholder="选择类型" />
+          </Form.Item>
+          <Form.Item name="value" label="实体值">
+            <Input placeholder="实体的具体值，如URL、账号等" style={{ borderRadius: 10 }} />
+          </Form.Item>
+          <Form.Item name="source" label="来源">
+            <Input placeholder="情报来源" style={{ borderRadius: 10 }} />
+          </Form.Item>
+          <Form.Item name="description" label="描述">
+            <Input.TextArea rows={3} placeholder="实体描述信息" style={{ borderRadius: 10 }} />
+/* 黑灰产知识图谱构建与关联分析系统 V1.0 */
+/* Page 60 */
+          </Form.Item>
+        </Form>
+      </Modal>
+      <Modal
+        className="entity-modal"
+        open={relateOpen}
+        onCancel={() => { setRelateOpen(false); relateForm.resetFields(); }}
+        onOk={handleRelate}
+        width={480}
+        okText="创建关联"
+        cancelText="取消"
+        title="创建关联"
+        styles={{ content: { borderRadius: 16 }, mask: { borderRadius: 16 } }}
+      >
+        <div style={{ marginTop: 16 }}>
+          {selectedEntity && (
+            <div style={{
+              padding: 14,
+              background: '#FAFBFC',
+              borderRadius: 10,
+              border: `1px solid ${BORDER_LIGHT}`,
+              marginBottom: 16,
+            }}>
+              <span style={{ fontSize: 12, fontFamily: BODY_FONT, color: TEXT_LIGHT }}>当前实体 </span>
+              <span style={{ fontWeight: 600, fontFamily: BODY_FONT, fontSize: 13, color: ACCENT_BLUE }}>{String(selectedEntity.name || selectedEntity.value || '—')}</span>
+            </div>
+          )}
+          <Form form={relateForm} layout="vertical">
+            <Form.Item name="target_id" label="目标实体ID" rules={[{ required: true, message: '请输入目标实体ID' }]}>
+              <Input placeholder="输入要关联的实体ID" style={{ borderRadius: 10 }} />
+            </Form.Item>
+            <Form.Item name="relationship_type" label="关系类型" rules={[{ required: true, message: '请选择关系类型' }]}>
+              <Select options={[
+                { value: 'related_to', label: '相关' },
+                { value: 'uses', label: '使用' },
+                { value: 'belongs_to', label: '属于' },
+                { value: 'communicates_with', label: '通信' },
+                { value: 'located_in', label: '位于' },
+              ]} placeholder="选择关系类型" />
+            </Form.Item>
+            <Form.Item name="description" label="关系描述">
+              <Input.TextArea rows={2} placeholder="描述两个实体之间的关系" style={{ borderRadius: 10 }} />
+            </Form.Item>
+          </Form>
+        </div>
+      </Modal>
+    </div>
+  );
+};
+export default Entities;

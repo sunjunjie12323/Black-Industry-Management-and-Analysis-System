@@ -1,0 +1,18 @@
+import sys
+sys.path.insert(0, r"c:\Users\sunjunjie\Desktop\vibe coding项目\黑产系统\threat-intel-agent\backend")
+from app.config import settings
+print('Config loaded OK')
+print(f'  LLM_BASE_URL: "{settings.LLM_BASE_URL}"')
+print(f'  LLM_MODEL_NAME: "{settings.LLM_MODEL_NAME}"')
+print(f'  DATABASE_URL: "{settings.DATABASE_URL}"')
+print(f'  APP_VERSION: {settings.APP_VERSION}')
+print(f'  BACKUP_INTERVAL_SECONDS: {settings.BACKUP_INTERVAL_SECONDS}')
+print(f'  MAX_LOGIN_FAILS: {settings.MAX_LOGIN_FAILS}')
+print(f'  LOCKOUT_MINUTES: {settings.LOCKOUT_MINUTES}')
+print(f'  PASSWORD_MIN_LENGTH: {settings.PASSWORD_MIN_LENGTH}')
+print(f'  SESSION_TIMEOUT_MINUTES: {settings.SESSION_TIMEOUT_MINUTES}')
+print(f'  REDOC_CDN_URL: {settings.REDOC_CDN_URL}')
+print(f'  PROGRESS_MAX_AGE_SECONDS: {settings.PROGRESS_MAX_AGE_SECONDS}')
+print(f'  THREAT_KEYWORDS_JSON: "{settings.THREAT_KEYWORDS_JSON}"')
+print(f'  forbidden_passwords_set: {len(settings.forbidden_passwords_set)} items')
+print(f'  is_production: {settings.is_production}')

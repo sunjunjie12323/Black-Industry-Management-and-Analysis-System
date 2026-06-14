@@ -1,0 +1,12 @@
+import sqlite3
+conn = sqlite3.connect('threat_intel.db')
+cursor = conn.cursor()
+cursor.execute('SELECT COUNT(*) FROM raw_intelligence')
+print(f'Raw Intelligence: {cursor.fetchone()[0]}')
+cursor.execute('SELECT COUNT(*) FROM cleaned_intelligence')
+print(f'Cleaned Intelligence: {cursor.fetchone()[0]}')
+cursor.execute('SELECT COUNT(*) FROM analyzed_intelligence')
+print(f'Analyzed Intelligence: {cursor.fetchone()[0]}')
+cursor.execute('SELECT COUNT(*) FROM alerts')
+print(f'Alerts: {cursor.fetchone()[0]}')
+conn.close()

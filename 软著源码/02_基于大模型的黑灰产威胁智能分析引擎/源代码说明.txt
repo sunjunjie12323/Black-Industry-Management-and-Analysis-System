@@ -1,0 +1,42 @@
+软件名称：基于大模型的黑灰产威胁智能分析引擎
+版本号：V1.0
+总代码行数（不含空行）：9678
+提交页数：60页
+每页行数：50行
+包含源文件：
+  - api/deepseek.py (713 行)
+  - api/threat_analysis.py (210 行)
+  - api/attack_prediction.py (254 行)
+  - api/zero_day.py (225 行)
+  - api/attribution.py (239 行)
+  - api/provenance.py (271 行)
+  - api/temporal_decay.py (112 行)
+  - core/attack_chain_predictor.py (1067 行)
+  - core/zero_day_detector.py (1428 行)
+  - core/entity_attribution.py (687 行)
+  - core/provenance_chain.py (781 行)
+  - core/temporal_decay.py (466 行)
+  - core/evidence_chain.py (610 行)
+  - core/llm.py (758 行)
+  - core/local_embedding.py (233 行)
+  - core/vector_store.py (319 行)
+  - engine/analysis_engine.py (144 行)
+  - engine/deep_analysis.py (121 行)
+  - engine/analyzers/attack_prediction.py (59 行)
+  - engine/analyzers/zero_day.py (61 行)
+  - engine/analyzers/attribution.py (56 行)
+  - engine/analyzers/provenance.py (59 行)
+  - engine/analyzers/decay.py (63 行)
+  - pages/AttackPrediction.tsx (211 行)
+  - pages/Attribution.tsx (207 行)
+  - pages/Provenance.tsx (246 行)
+
+格式说明：
+  - Word文档(.docx)格式
+  - 字体：Consolas 10号
+  - 行距：固定15磅
+  - 页边距：上下左右2.5cm
+  - 页眉：软件名称+版本号+页码
+  - 已删除含人名/地址/时间/版权的注释
+  - 每页50行有效代码（不含空行）
+  - 代码超过3000行，提交前30页+后30页

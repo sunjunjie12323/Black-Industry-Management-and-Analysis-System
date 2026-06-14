@@ -1,0 +1,27 @@
+软件名称：黑灰产知识图谱构建与关联分析系统
+版本号：V1.0
+总代码行数（不含空行）：6114
+提交页数：60页
+每页行数：50行
+包含源文件：
+  - api/graph.py (452 行)
+  - api/entities.py (167 行)
+  - api/ner.py (68 行)
+  - core/knowledge_graph.py (427 行)
+  - core/ner_engine.py (564 行)
+  - core/entity_attribution.py (687 行)
+  - core/rule_based_extractor.py (768 行)
+  - core/vector_store.py (319 行)
+  - core/local_embedding.py (233 行)
+  - pages/Graph.tsx (1387 行)
+  - pages/Entities.tsx (1009 行)
+
+格式说明：
+  - Word文档(.docx)格式
+  - 字体：Consolas 10号
+  - 行距：固定15磅
+  - 页边距：上下左右2.5cm
+  - 页眉：软件名称+版本号+页码
+  - 已删除含人名/地址/时间/版权的注释
+  - 每页50行有效代码（不含空行）
+  - 代码超过3000行，提交前30页+后30页
