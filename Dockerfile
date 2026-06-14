@@ -1,16 +1,16 @@
-FROM node:20-alpine AS frontend-build
+FROM docker.1ms.run/library/node:20-alpine AS frontend-build
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --no-cache
+RUN npm ci --no-cache --registry=https://registry.npmmirror.com
 COPY frontend/ ./
-RUN npm run build
+RUN npm run build --registry=https://registry.npmmirror.com
 
-FROM python:3.11-slim
+FROM docker.1ms.run/library/python:3.11-slim
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
 
 COPY backend/ ./backend/
 RUN find /app/backend -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; true
