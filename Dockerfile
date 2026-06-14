@@ -16,7 +16,7 @@ COPY backend/ ./backend/
 COPY --from=frontend-build /app/frontend/dist ./backend/frontend_dist/
 
 ENV PYTHONPATH=/app/backend
-ENV ENVIRONMENT=production
+ENV ENVIRONMENT=development
 ENV DATABASE_URL=sqlite+aiosqlite:///./threat_intel.db
 ENV CORS_ORIGINS=["*"]
 EXPOSE 8000
