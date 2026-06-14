@@ -13,6 +13,7 @@ COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ ./backend/
+RUN find /app/backend -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; true
 COPY --from=frontend-build /app/frontend/dist ./backend/frontend_dist/
 
 ENV PYTHONPATH=/app/backend
