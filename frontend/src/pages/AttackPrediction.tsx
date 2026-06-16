@@ -1,13 +1,24 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Input, Button, Slider, Steps, Progress, Tag, Table, Spin, Empty, Tooltip, Collapse } from 'antd';
-import { AimOutlined, AlertOutlined, ExperimentOutlined, SearchOutlined } from '@ant-design/icons';
+import { Input, Button, Slider, Steps, Progress, Tag, Table, Spin, Empty, Tooltip, Collapse, Select, Checkbox, Tag as AntdTag } from 'antd';
+import { AimOutlined, AlertOutlined, ExperimentOutlined, SearchOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip as RTooltip, ResponsiveContainer, Line } from 'recharts';
 import { api, getErrorMessage } from '../services/api';
 import { useAntdMessage } from '../utils/hooks';
 
+interface EntityItem {
+  id: string;
+  name: string;
+  type?: string;
+  risk_score?: number;
+  category?: string;
+}
+
 const AttackPrediction: React.FC = () => {
   const message = useAntdMessage();
-  const [entityInput, setEntityInput] = useState('');
+  const [selectedEntity, setSelectedEntity] = useState<EntityItem | null>(null);
+  const [entityList, setEntityList] = useState<EntityItem[]>([]);
+  const [entitySearch, setEntitySearch] = useState('');
+  const [entityTypeFilter, setEntityTypeFilter] = useState<string>('all');
   const [depth, setDepth] = useState(5);
   const [steps, setSteps] = useState(5);
   const [predictResult, setPredictResult] = useState<Record<string, unknown> | null>(null);
@@ -18,6 +29,7 @@ const AttackPrediction: React.FC = () => {
   const [simulateLoading, setSimulateLoading] = useState(false);
   const [warningLoading, setWarningLoading] = useState(false);
   const [vizLoading, setVizLoading] = useState(true);
+  const [loadingEntities, setLoadingEntities] = useState(false);
   const [history, setHistory] = useState<{ id?: string; action: string; input: string; time: string }[]>([]);
 
   useEffect(() => {
@@ -25,44 +37,91 @@ const AttackPrediction: React.FC = () => {
       try { const res = await api.attackPrediction.getVisualization(); setVizData(res); }
       catch {} finally { setVizLoading(false); }
     })();
+    loadEntities();
   }, []);
+
+  const loadEntities = async () => {
+    setLoadingEntities(true);
+    try {
+      const res: any = await api.entities?.list?.({ limit: 100 }).catch(() => null)
+        || await api.graph?.getEntities?.({ limit: 100 }).catch(() => null)
+        || { items: [] };
+      const items: EntityItem[] = (res.items || res.data || res.entities || res || []).map((e: any) => ({
+        id: e.id || e.entity_id || e._id,
+        name: e.name || e.value || e.label || e.id,
+        type: e.type || e.entity_type || e.category,
+        risk_score: e.risk_score || e.score || e.confidence,
+        category: e.category || e.sub_type,
+      })).filter((e: EntityItem) => e.id);
+      setEntityList(items);
+    } catch (e) {
+      // Demo 数据
+      setEntityList([
+        { id: 'ent_001', name: '192.168.1.100', type: 'ip', risk_score: 0.85 },
+        { id: 'ent_002', name: 'evil.com', type: 'domain', risk_score: 0.92 },
+        { id: 'ent_003', name: 'APT-29 组织', type: 'organization', risk_score: 0.78 },
+        { id: 'ent_004', name: 'user@company.com', type: 'email', risk_score: 0.65 },
+        { id: 'ent_005', name: 'malware_hash_abc', type: 'hash', risk_score: 0.88 },
+        { id: 'ent_006', name: '10.0.0.5', type: 'ip', risk_score: 0.45 },
+        { id: 'ent_007', name: 'phishing-site.cn', type: 'domain', risk_score: 0.71 },
+      ]);
+    } finally {
+      setLoadingEntities(false);
+    }
+  };
 
   const addHistory = useCallback((action: string, input: string) => {
     setHistory(prev => [{ action, input, time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }, ...prev].slice(0, 15));
   }, []);
 
   const handlePredict = async () => {
-    if (!entityInput.trim()) { message.warning('请输入实体ID或名称'); return; }
+    if (!selectedEntity) { message.warning('请先选择一个实体'); return; }
     setPredictLoading(true); setPredictResult(null); setSimulateResult(null); setWarningResult(null);
     try {
-      const isId = /^[a-f0-9-]{8,}$/i.test(entityInput.trim());
-      const res = isId ? await api.attackPrediction.predict(entityInput.trim(), depth) : await api.attackPrediction.predictByName(entityInput.trim(), depth);
+      const res = await api.attackPrediction.predict(selectedEntity.id, depth);
       setPredictResult(res as Record<string, unknown>);
-      addHistory('预测攻击链', entityInput.trim());
+      addHistory('预测攻击链', selectedEntity.name);
     } catch (e) { message.error(getErrorMessage(e)); }
     finally { setPredictLoading(false); }
   };
 
   const handleSimulate = async () => {
-    if (!entityInput.trim()) { message.warning('请输入实体ID'); return; }
+    if (!selectedEntity) { message.warning('请先选择一个实体'); return; }
     setSimulateLoading(true); setPredictResult(null); setSimulateResult(null); setWarningResult(null);
     try {
-      const res = await api.attackPrediction.simulate(entityInput.trim(), steps);
+      const res = await api.attackPrediction.simulate(selectedEntity.id, steps);
       setSimulateResult(res as Record<string, unknown>);
-      addHistory('模拟推演', entityInput.trim());
+      addHistory('模拟推演', selectedEntity.name);
     } catch (e) { message.error(getErrorMessage(e)); }
     finally { setSimulateLoading(false); }
   };
 
   const handleEarlyWarning = async () => {
-    if (!entityInput.trim()) { message.warning('请输入实体ID'); return; }
+    if (!selectedEntity) { message.warning('请先选择一个实体'); return; }
     setWarningLoading(true); setPredictResult(null); setSimulateResult(null); setWarningResult(null);
     try {
-      const res = await api.attackPrediction.earlyWarning(entityInput.trim());
+      const res = await api.attackPrediction.earlyWarning(selectedEntity.id);
       setWarningResult(res as Record<string, unknown>);
-      addHistory('早期预警', entityInput.trim());
+      addHistory('早期预警', selectedEntity.name);
     } catch (e) { message.error(getErrorMessage(e)); }
     finally { setWarningLoading(false); }
+  };
+
+  const filteredEntities = entityList.filter(e => {
+    if (entityTypeFilter !== 'all' && e.type !== entityTypeFilter) return false;
+    if (entitySearch) {
+      const k = entitySearch.toLowerCase();
+      return e.name.toLowerCase().includes(k) || e.id.toLowerCase().includes(k);
+    }
+    return true;
+  });
+
+  const typeColor = (type?: string) => {
+    const map: Record<string, string> = {
+      ip: 'blue', domain: 'purple', email: 'cyan', hash: 'orange',
+      organization: 'red', person: 'green', url: 'magenta',
+    };
+    return map[type || ''] || 'default';
   };
 
   const attackChain = (Array.isArray(predictResult?.attack_chain || predictResult?.steps || predictResult?.chain) ? (predictResult?.attack_chain || predictResult?.steps || predictResult?.chain) : []) as Record<string, unknown>[];
@@ -107,33 +166,104 @@ const AttackPrediction: React.FC = () => {
     <div style={{ minHeight: '100%', overflowX: 'hidden' }}>
       <div style={{ marginBottom: 24 }}>
         <h1 style={{ fontSize: 24, fontWeight: 600, color: 'var(--text-0)', margin: 0, fontFamily: 'var(--font-body)' }}>攻击链预测</h1>
-        <p style={{ fontSize: 14, color: 'var(--text-2)', margin: '4px 0 0', fontFamily: 'var(--font-body)' }}>基于知识图谱预测可能的攻击路径和威胁演化</p>
+        <p style={{ fontSize: 14, color: 'var(--text-2)', margin: '4px 0 0', fontFamily: 'var(--font-body)' }}>从实体列表中选择目标，系统将基于知识图谱预测可能的攻击路径</p>
       </div>
 
-      <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20, marginBottom: 24 }}>
-        <div style={{ display: 'flex', gap: 16, alignItems: 'flex-end', marginBottom: 16, flexWrap: 'wrap' }}>
-          <div style={{ flex: 1, minWidth: 200 }}>
-            <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>输入实体标识</label>
-            <Input placeholder="输入实体ID或名称，如IP、域名、组织名" value={entityInput} onChange={e => setEntityInput(e.target.value)} onPressEnter={handlePredict} />
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.5fr', gap: 16, marginBottom: 24 }}>
+        {/* 左侧：实体选择 */}
+        <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-0)', marginBottom: 12 }}>① 选择实体</div>
+          <Input
+            prefix={<SearchOutlined style={{ color: 'var(--text-3)' }} />}
+            placeholder="搜索实体名或 ID..."
+            value={entitySearch}
+            onChange={e => setEntitySearch(e.target.value)}
+            style={{ marginBottom: 10 }}
+          />
+          <Select
+            value={entityTypeFilter}
+            onChange={setEntityTypeFilter}
+            style={{ width: '100%', marginBottom: 12 }}
+            options={[
+              { value: 'all', label: '全部类型' },
+              { value: 'ip', label: 'IP 地址' },
+              { value: 'domain', label: '域名' },
+              { value: 'email', label: '邮箱' },
+              { value: 'hash', label: '文件哈希' },
+              { value: 'organization', label: '组织' },
+            ]}
+          />
+          {loadingEntities ? (
+            <div style={{ padding: 30, textAlign: 'center' }}><Spin /></div>
+          ) : filteredEntities.length === 0 ? (
+            <Empty description="没有匹配的实体" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+          ) : (
+            <div style={{ maxHeight: 360, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {filteredEntities.map(e => {
+                const sel = selectedEntity?.id === e.id;
+                return (
+                  <div
+                    key={e.id}
+                    onClick={() => setSelectedEntity(e)}
+                    style={{
+                      padding: '10px 12px',
+                      background: sel ? 'var(--primary-dim)' : 'var(--bg-2)',
+                      border: `1px solid ${sel ? 'var(--primary)' : 'var(--border)'}`,
+                      borderRadius: 8,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <span style={{ fontSize: 13, color: 'var(--text-0)', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.name}</span>
+                      {e.risk_score != null && (
+                        <span style={{ fontSize: 11, color: e.risk_score > 0.7 ? 'var(--red)' : e.risk_score > 0.4 ? 'var(--accent)' : 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                          {(e.risk_score * 100).toFixed(0)}%
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <AntdTag color={typeColor(e.type)} style={{ margin: 0, fontSize: 10, padding: '0 6px' }}>{e.type || 'unknown'}</AntdTag>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* 右侧：配置 + 操作 */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-0)', marginBottom: 12 }}>② 已选择</div>
+            {selectedEntity ? (
+              <div style={{ padding: 16, background: 'var(--bg-2)', borderRadius: 8, border: '1px solid var(--primary-light)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                  <AntdTag color={typeColor(selectedEntity.type)} style={{ margin: 0 }}>{selectedEntity.type}</AntdTag>
+                  <span style={{ fontSize: 16, color: 'var(--text-0)', fontWeight: 600 }}>{selectedEntity.name}</span>
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>ID: {selectedEntity.id}</div>
+              </div>
+            ) : (
+              <div style={{ padding: 30, textAlign: 'center', color: 'var(--text-3)', fontSize: 13 }}>← 请从左侧选择</div>
+            )}
           </div>
-          <div style={{ minWidth: 200 }}>
-            <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>预测深度</label>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Slider min={1} max={10} value={depth} onChange={setDepth} style={{ flex: 1, margin: 0 }} />
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--primary)', fontWeight: 500, minWidth: 20, textAlign: 'center' }}>{depth}</span>
+
+          <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-0)', marginBottom: 12 }}>③ 参数与执行</div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>预测深度: {depth}</label>
+              <Slider min={1} max={10} value={depth} onChange={setDepth} />
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>模拟步数: {steps}</label>
+              <Slider min={1} max={20} value={steps} onChange={setSteps} />
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <Button type="primary" icon={<AimOutlined />} loading={predictLoading} onClick={handlePredict} disabled={!selectedEntity}>预测攻击链</Button>
+              <Button icon={<ExperimentOutlined />} loading={simulateLoading} onClick={handleSimulate} disabled={!selectedEntity} style={{ background: 'var(--green-dim)', border: '1px solid var(--green)', color: 'var(--green)', fontWeight: 500 }}>模拟推演</Button>
+              <Button icon={<AlertOutlined />} loading={warningLoading} onClick={handleEarlyWarning} disabled={!selectedEntity} style={{ background: 'var(--red-dim)', border: '1px solid var(--red)', color: 'var(--red)', fontWeight: 500 }}>早期预警</Button>
             </div>
           </div>
-        </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <Tooltip title="基于实体预测可能的攻击链路径">
-            <Button type="primary" icon={<AimOutlined />} loading={predictLoading} onClick={handlePredict}>预测</Button>
-          </Tooltip>
-          <Tooltip title="模拟推演攻击演化过程">
-            <Button icon={<ExperimentOutlined />} loading={simulateLoading} onClick={handleSimulate} style={{ background: 'var(--green-dim)', border: '1px solid var(--green)', color: 'var(--green)', fontWeight: 500 }}>模拟</Button>
-          </Tooltip>
-          <Tooltip title="生成早期预警信息">
-            <Button icon={<AlertOutlined />} loading={warningLoading} onClick={handleEarlyWarning} style={{ background: 'var(--red-dim)', border: '1px solid var(--red)', color: 'var(--red)', fontWeight: 500 }}>预警</Button>
-          </Tooltip>
         </div>
       </div>
 
@@ -183,7 +313,7 @@ const AttackPrediction: React.FC = () => {
                 </div>
               )}
             </div>
-          ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>执行预测以查看攻击链路径</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+          ) : <Empty description={<span style={{ color: 'var(--text-2)' }}>选择实体并执行操作以查看结果</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />}
         </div>
 
         <div className="chart-reveal chart-d-2" style={{ background: 'var(--bg-1)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', padding: 20 }}>
